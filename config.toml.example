@@ -1,0 +1,79 @@
+# RAGMcp Configuration File
+# Copy this to config.toml and adjust values
+
+[ragmcp]
+# Path to your documentation root directory (set this to your own docs folder)
+rag_folder = "/path/to/your/docs"
+
+# Path to SQLite database file
+db_path = "./ragmcp.db"
+
+# Logging level: trace, debug, info, warn, error
+log_level = "info"
+
+[embeddings]
+# Embedding provider: "openai" (more providers can be added later)
+provider = "openai"
+
+# OpenAI embedding model
+model = "text-embedding-3-small"
+
+# Environment variable containing API key
+api_key_env = "OPENAI_API_KEY"
+
+# Number of texts to embed per API request (OpenAI supports up to 2048)
+batch_size = 100
+
+# Embedding dimensions (text-embedding-3-small uses 1536)
+dimensions = 1536
+
+# LRU cache capacity for query embeddings (0 = disabled)
+# Caching reduces API calls for repeated queries
+cache_capacity = 1000
+
+[search]
+# Default number of results to return
+default_k = 5
+
+# Minimum relevance score (0.0 to 1.0)
+min_score = 0.65
+
+# Weight for BM25 search in hybrid mode
+hybrid_bm25_weight = 0.5
+
+# Weight for vector search in hybrid mode
+hybrid_vector_weight = 0.5
+
+[performance]
+# Maximum acceptable latency in milliseconds
+max_latency_ms = 1000
+
+# Size of each text chunk in tokens
+chunk_size_tokens = 300
+
+# Overlap between chunks in tokens
+chunk_overlap_tokens = 50
+
+[http_server]
+# Enable HTTP server mode (for custom connectors via Cloudflare tunnel)
+# When enabled, use 'serve-http' command instead of 'serve'
+enabled = false
+
+# Port to bind HTTP server (default: 8080)
+port = 8080
+
+# Environment variable containing API key for HTTP authentication
+# Set this in your .env file: RAGMCP_API_KEY=your-secret-key-here
+# Not required if authless = true
+api_key_env = "RAGMCP_API_KEY"
+
+# Allowed origins for CORS (prevents DNS rebinding attacks)
+# Add origins that should be allowed to access the HTTP endpoint
+# Not used if authless = true
+allowed_origins = [
+    "https://your-server.example.com"
+]
+
+# Authless mode: If true, no authentication required (public access)
+# Recommended for testing or if using Cloudflare Tunnel with additional security
+authless = true

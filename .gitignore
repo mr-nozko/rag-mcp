@@ -1,0 +1,39 @@
+# Rust
+/target/
+**/*.rs.bk
+# NOTE: Cargo.lock is intentionally committed for binary crates.
+# This ensures reproducible builds for all users (pinned dependency tree).
+# See: https://doc.rust-lang.org/cargo/faq.html#why-do-binaries-have-cargolock-in-version-control
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+
+# Config (may contain secrets)
+config.toml
+*.local.toml
+cloudflared-config.yaml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+
+# Cursor
+.cursor/*
+.cursorrules
+.cursor

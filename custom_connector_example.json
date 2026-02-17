@@ -1,0 +1,27 @@
+{
+  "name": "RAGMcp",
+  "description": "Retrieval Language Model MCP Server",
+  "url": "https://your-server.example.com/mcp",
+  "auth": {
+    "type": "bearer",
+    "token": "${RAGMCP_API_KEY}",
+    "description": "Set RAGMCP_API_KEY environment variable with your API key"
+  },
+  "endpoints": {
+    "mcp": "/mcp",
+    "health": "/health"
+  },
+  "methods": [
+    "initialize",
+    "tools/list",
+    "tools/call",
+    "shutdown"
+  ],
+  "tools": [
+    "ragmcp_search",
+    "ragmcp_get",
+    "ragmcp_list",
+    "ragmcp_related",
+    "ragmcp_explain"
+  ]
+}

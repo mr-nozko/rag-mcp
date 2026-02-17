@@ -1,0 +1,31 @@
+# Cloudflare Tunnel Configuration
+# This file configures the cloudflared tunnel to expose the RAGMcp HTTP server
+
+# Tunnel UUID - Replace with your actual tunnel UUID
+# You can find this in the Cloudflare Zero Trust dashboard after creating a tunnel
+tunnel: <TUNNEL_UUID>
+
+# Path to credentials file
+# On Windows, this is typically in: C:\Users\<USERNAME>\.cloudflared\<UUID>.json
+# Replace <USERNAME> with your Windows username and <UUID> with your tunnel UUID
+credentials-file: C:\Users\<USERNAME>\.cloudflared\<UUID>.json
+
+# Ingress rules - define how traffic is routed
+ingress:
+  # Route your-server.example.com to local HTTP server
+  # Replace with your actual hostname configured in Cloudflare DNS
+  - hostname: your-server.example.com
+    service: http://localhost:8081
+  
+  # Fallback rule - return 404 for unmatched requests
+  - service: http_status:404
+
+# Optional: Origin request settings
+# Uncomment and adjust if needed
+# originRequest:
+#   # Skip TLS verification if using self-signed certs locally
+#   noTLSVerify: true
+#   # Connection timeout
+#   connectTimeout: 30s
+#   # TCP keep-alive
+#   tcpKeepAlive: 30s

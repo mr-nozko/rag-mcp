@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ragmcp": {
+      "command": "ragmcp",
+      "args": ["serve"],
+      "env": {
+        "OPENAI_API_KEY": "sk-your-api-key-here",
+        "RUST_LOG": "info"
+      }
+    }
+  }
+}

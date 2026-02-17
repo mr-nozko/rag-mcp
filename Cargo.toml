@@ -1,0 +1,103 @@
+[package]
+name = "ragmcp"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.71"
+authors = ["Peye Labs"]
+description = "RAGMcp - Hybrid RAG MCP Server for your documentation"
+license = "MIT"
+
+[dependencies]
+# Async Runtime
+tokio = { version = "1.49", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Database (simplified to rusqlite)
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# HTTP & Embeddings
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# HTTP Server (for MCP HTTP transport)
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+tokio-stream = "0.1"
+futures-util = "0.3"
+url = "2.5"
+
+# Error Handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Logging (simplified to log)
+log = "0.4"
+env_logger = "0.11"
+
+# Configuration
+toml = "0.9"
+dotenv = "0.15"
+
+# Crypto & Utilities
+sha2 = "0.10"
+uuid = { version = "1.18", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+
+# File System & Parsing
+walkdir = "2.5"
+quick-xml = { version = "0.39", features = ["serialize"] }
+serde_yaml_ng = "0.10"
+pulldown-cmark = "0.13"
+
+# Caching
+lru = "0.16"
+
+# Knowledge graph (Module 9)
+regex = "1.12"
+
+# CLI argument parsing (incremental ingestion)
+clap = { version = "4.5", features = ["derive"] }
+
+# File watching (Module 10 watch)
+notify = "6"
+
+[dev-dependencies]
+tempfile = "3.12"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[[bin]]
+name = "ragmcp"
+path = "src/main.rs"
+
+[[bin]]
+name = "ingest"
+path = "src/bin/ingest.rs"
+
+[[bin]]
+name = "embed"
+path = "src/bin/embed.rs"
+
+[[bin]]
+name = "search"
+path = "src/bin/search.rs"
+
+[[bin]]
+name = "stats"
+path = "src/bin/stats.rs"
+
+[[bin]]
+name = "watch"
+path = "src/bin/watch.rs"
+
+[[bin]]
+name = "eval"
+path = "src/bin/eval.rs"
