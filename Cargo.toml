@@ -68,6 +68,12 @@ notify = "6"
 [dev-dependencies]
 tempfile = "3.12"
 
+[profile.dev]
+# Disable incremental compilation: avoids the "hard linking files in incremental
+# cache failed" warning on Windows NTFS, which doesn't fully support Cargo's
+# hard-link strategy. Slight rebuild slowdown is acceptable in dev.
+incremental = false
+
 [profile.release]
 opt-level = 3
 lto = true

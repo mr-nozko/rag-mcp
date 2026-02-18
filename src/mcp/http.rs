@@ -183,14 +183,19 @@ struct AppState {
     sessions: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<JsonRpcResponse>>>>,
 }
 
-/// OAuth authorization code data
+/// OAuth authorization code data (PKCE flow).
+/// `client_id` and `state` are stored but not yet validated at token exchange;
+/// they are reserved for client-identity verification and CSRF protection
+/// once the full OAuth token-exchange handler is implemented.
 #[derive(Clone, Debug)]
 struct AuthCodeData {
+    #[allow(dead_code)]
     client_id: String,
     redirect_uri: String,
     code_challenge: String,
     code_challenge_method: String,
-    state: String,
+    #[allow(dead_code)]
+    state: String,          // CSRF token — must be echoed back to client on redirect
     expires_at: chrono::DateTime<chrono::Utc>,
 }
 

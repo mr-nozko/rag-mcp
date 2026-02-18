@@ -31,6 +31,53 @@ fn build_embedder(config: &Config) -> Result<OpenAIEmbedder> {
     ))
 }
 
+/// Query and log key database stats at startup so the operator can immediately
+/// verify the index is populated before accepting requests.
+async fn log_db_stats(db: &Db) -> Result<()> {
+    let (doc_count, chunk_count, embedded_count) = db
+        .with_connection(|conn| {
+            let doc_count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))?;
+            let chunk_count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))?;
+            let embedded_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok::<_, ragmcp::error::RagmcpError>((doc_count, chunk_count, embedded_count))
+        })
+        .await?;
+
+    let unembedded = chunk_count - embedded_count;
+    log::info!(
+        "Index: {} docs | {} chunks ({} embedded, {} pending)",
+        doc_count, chunk_count, embedded_count, unembedded
+    );
+    Ok(())
+}
+
+/// Print the RAG MCP ASCII-art startup banner to stderr (stdio reserved for JSON-RPC).
+fn print_startup_banner() {
+    eprintln!(
+        r#"
+
+$$$$$$$\   $$$$$$\   $$$$$$\        $$\      $$\  $$$$$$\  $$$$$$$\  
+$$  __$$\ $$  __$$\ $$  __$$\       $$$\    $$$ |$$  __$$\ $$  __$$\ 
+$$ |  $$ |$$ /  $$ |$$ /  \__|      $$$$\  $$$$ |$$ /  \__|$$ |  $$ |
+$$$$$$$  |$$$$$$$$ |$$ |$$$$\       $$\$$\$$ $$ |$$ |      $$$$$$$  |
+$$  __$$< $$  __$$ |$$ |\_$$ |      $$ \$$$  $$ |$$ |      $$  ____/ 
+$$ |  $$ |$$ |  $$ |$$ |  $$ |      $$ |\$  /$$ |$$ |  $$\ $$ |      
+$$ |  $$ |$$ |  $$ |\$$$$$$  |      $$ | \_/ $$ |\$$$$$$  |$$ |      
+\__|  \__|\__|  \__| \______/       \__|     \__| \______/ \__|      
+
+v{}
+
+"#,
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logger from environment variable or default to info level
@@ -64,18 +111,20 @@ async fn main() -> Result<()> {
 
 /// Run MCP server (stdio transport)
 async fn run_mcp_server() -> Result<()> {
+    print_startup_banner();
+
     // Load configuration
     let config = Config::load()?;
     
-    // Initialize database
+    // Initialize database and run any pending migrations
     let db = Db::new(config.db_path());
-    
-    // Run migrations
     let migrations_dir = Path::new("migrations");
     db.with_connection(|conn| {
         migrate::run_migrations(conn, migrations_dir)
     }).await?;
-    
+    log::info!("Database initialized successfully");
+    log_db_stats(&db).await?;
+
     let embedder = build_embedder(&config)?;
     let chunk_cache = Some(Arc::new(ChunkEmbeddingCache::new()));
 
@@ -88,8 +137,10 @@ async fn run_mcp_server() -> Result<()> {
 
 /// Run HTTP MCP server
 async fn run_http_server() -> Result<()> {
+    print_startup_banner();
+
     log::info!("Starting RAGMcp HTTP Server v{}", env!("CARGO_PKG_VERSION"));
-    
+
     // Load configuration
     let config = Config::load()?;
     
@@ -101,8 +152,8 @@ async fn run_http_server() -> Result<()> {
     db.with_connection(|conn| {
         migrate::run_migrations(conn, migrations_dir)
     }).await?;
-    
     log::info!("Database initialized successfully");
+    log_db_stats(&db).await?;
 
     let embedder = build_embedder(&config)?;
     let chunk_cache = Some(Arc::new(ChunkEmbeddingCache::new()));

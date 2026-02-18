@@ -346,6 +346,9 @@ struct GetParams {
     doc_path: String,
     #[serde(default)]
     return_full_doc: bool,
+    /// Section filter — part of the MCP API contract; section-level retrieval
+    /// is not yet implemented. Reserved for future partial-document responses.
+    #[allow(dead_code)]
     sections: Option<Vec<String>>,
 }
 
@@ -424,6 +427,10 @@ pub async fn handle_get(
 struct ListParams {
     list_type: String,
     agent_name: Option<String>,
+    /// Controls whether metadata (doc type, agent, etc.) is included in list
+    /// results. Part of the MCP API contract; metadata enrichment is not yet
+    /// applied — reserved for a richer list response in a future iteration.
+    #[allow(dead_code)]
     #[serde(default = "default_true")]
     include_metadata: bool,
 }

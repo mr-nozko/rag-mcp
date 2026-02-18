@@ -79,7 +79,8 @@ async fn get_stored_hash_for_path(db: &Db, doc_path: &str) -> Result<Option<Stri
     Ok(out)
 }
 
-/// Handle a single file change: hash check, ingest if changed, then embed new chunks.
+/// Handle a single file change: hash check, ingest if changed, then embed chunks that have no embedding.
+/// When file hash is unchanged we skip re-ingestion but still backfill any chunks with NULL embeddings.
 pub async fn handle_file_change(
     db: &Db,
     config: &Config,
@@ -95,19 +96,51 @@ pub async fn handle_file_change(
         None => return Ok(()),
     };
 
+    // doc_id must match insert_document: SHA256 of doc_path (relative_path)
+    let doc_id = format!("{:x}", Sha256::digest(file.relative_path.as_bytes()));
     let current_hash = compute_file_hash(&file.absolute_path)?;
-    if let Some(stored) = get_stored_hash_for_path(db, &file.relative_path).await? {
-        if stored == current_hash {
+    let stored_hash = get_stored_hash_for_path(db, &file.relative_path).await?;
+
+    let hash_unchanged = stored_hash.as_deref() == Some(current_hash.as_str());
+
+    if hash_unchanged {
+        // Skip re-ingestion; still backfill any chunks that have NULL embedding for this doc
+        let chunks = get_chunks_without_embedding_for_doc(db, &doc_id).await?;
+        if chunks.is_empty() {
+            log::info!("watch: {} skip (unchanged, all embedded)", file.relative_path);
             return Ok(());
         }
+        let batch_size = config.embeddings.batch_size;
+        let mut stored = 0;
+        for batch in chunks.chunks(batch_size) {
+            let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
+            let embeddings = embedder.embed_batch(texts).await?;
+            let pairs: Vec<(String, Vec<f32>)> = batch
+                .iter()
+                .map(|(id, _)| id.clone())
+                .zip(embeddings)
+                .collect();
+            stored += store_embeddings_batch(db, pairs).await?;
+        }
+        log::info!(
+            "watch: {} skip ingest, backfilled {} embeddings in {:?}",
+            file.relative_path,
+            stored,
+            start.elapsed()
+        );
+        return Ok(());
     }
 
+    // New or modified: re-ingest then embed only chunks without embeddings
     ingest_file(db, &file, parser_registry, config).await?;
 
-    let doc_id = format!("{:x}", Sha256::digest(file.relative_path.as_bytes()));
     let chunks = get_chunks_without_embedding_for_doc(db, &doc_id).await?;
     if chunks.is_empty() {
-        log::info!("watch: {} (no new chunks to embed)", file.relative_path);
+        log::info!(
+            "watch: {} ingested, no new chunks to embed in {:?}",
+            file.relative_path,
+            start.elapsed()
+        );
         return Ok(());
     }
 
@@ -125,7 +158,7 @@ pub async fn handle_file_change(
     }
 
     log::info!(
-        "watch: {} (ingested, {} chunks embedded) in {:?}",
+        "watch: {} ingested, {} chunks embedded in {:?}",
         file.relative_path,
         stored,
         start.elapsed()
@@ -186,6 +219,79 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Validates that doc_id derived in the watcher (SHA256 of relative_path) matches
+    /// insert_document, and that get_chunks_without_embedding_for_doc + store_embeddings_batch
+    /// correctly backfill NULL embeddings for that doc (no OpenAI API).
+    #[tokio::test]
+    async fn test_watcher_doc_id_consistency_and_backfill_embeddings() {
+        use crate::db::migrate;
+        use crate::embeddings::store_embeddings_batch;
+        use crate::ingest::chunker::Chunk;
+        use crate::ingest::db_writer::{insert_document, insert_chunks};
+        use std::path::Path;
+
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db = Db::new(&db_path);
+        let migrations_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        db.with_connection(move |conn| migrate::run_migrations(conn, &migrations_dir))
+            .await
+            .unwrap();
+
+        let relative_path = "agents/watcher_test.xml";
+        let doc_id_from_insert = insert_document(
+            &db,
+            relative_path,
+            "agent_prompt",
+            "agents",
+            Some("watcher_test"),
+            "Content for embedding backfill",
+            50,
+            "hash1",
+            std::time::SystemTime::now(),
+        )
+        .await
+        .unwrap();
+
+        let chunks = vec![
+            Chunk {
+                text: "Chunk one".to_string(),
+                tokens: 2,
+                section_header: Some("A".to_string()),
+                chunk_type: Some("test".to_string()),
+            },
+            Chunk {
+                text: "Chunk two".to_string(),
+                tokens: 2,
+                section_header: Some("B".to_string()),
+                chunk_type: Some("test".to_string()),
+            },
+        ];
+        insert_chunks(&db, &doc_id_from_insert, chunks).await.unwrap();
+
+        // Watcher uses the same doc_id derivation as insert_document (SHA256 of doc_path)
+        let doc_id_watcher = format!("{:x}", Sha256::digest(relative_path.as_bytes()));
+        assert_eq!(
+            doc_id_from_insert, doc_id_watcher,
+            "doc_id from insert_document must match watcher derivation"
+        );
+
+        let without_before = get_chunks_without_embedding_for_doc(&db, &doc_id_watcher).await.unwrap();
+        assert_eq!(without_before.len(), 2, "both chunks should have NULL embedding before backfill");
+
+        // Backfill with dummy embeddings (1536 dims to match schema; no API call)
+        let dummy_embedding: Vec<f32> = (0..1536).map(|i| i as f32 * 0.001).collect();
+        let pairs: Vec<(String, Vec<f32>)> = without_before
+            .iter()
+            .map(|(id, _)| (id.clone(), dummy_embedding.clone()))
+            .collect();
+        let stored = store_embeddings_batch(&db, pairs).await.unwrap();
+        assert_eq!(stored, 2);
+
+        let without_after = get_chunks_without_embedding_for_doc(&db, &doc_id_watcher).await.unwrap();
+        assert!(without_after.is_empty(), "no chunks should lack embedding after backfill");
+    }
 
     #[test]
     fn test_file_metadata_from_path_under_root_allowed_extension() {
