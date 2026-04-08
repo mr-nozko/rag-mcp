@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { getIndexStats, getNamespaceDistribution } from '@/lib/queries';
+import { getIndexStats, getNamespaceDistribution, getPageIndexStats } from '@/lib/queries';
 import { isAuthenticated } from '@/lib/auth';
 
 export async function GET() {
@@ -10,7 +10,9 @@ export async function GET() {
   try {
     const indexStats = getIndexStats();
     const namespaces = getNamespaceDistribution();
-    return NextResponse.json({ indexStats, namespaces });
+    const pageIndexStats = getPageIndexStats();
+    
+    return NextResponse.json({ indexStats, namespaces, pageIndex: pageIndexStats });
   } catch (error) {
     return NextResponse.json({ error: String(error) }, { status: 500 });
   }

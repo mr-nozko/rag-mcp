@@ -41,7 +41,7 @@ export default function EmbeddingVisualizer() {
     async function fetchChunks() {
       try {
         setLoadingChunks(true);
-        const response = await fetch(`/api/documents/${encodeURIComponent(selectedDoc)}`);
+        const response = await fetch(`/api/documents/${encodeURIComponent(selectedDoc as string)}`);
         
         if (!response.ok) {
           throw new Error('Failed to fetch document');

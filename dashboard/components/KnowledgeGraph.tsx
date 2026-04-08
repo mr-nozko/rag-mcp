@@ -47,7 +47,7 @@ export default function KnowledgeGraph({ onNodeClick }: Props) {
   const [graphData, setGraphData] = useState<GraphData>({ nodes: [], links: [] });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const graphRef = useRef<any>();
+  const graphRef = useRef<any>(null);
 
   useEffect(() => {
     async function fetchGraphData() {
@@ -152,41 +152,43 @@ export default function KnowledgeGraph({ onNodeClick }: Props) {
       </div>
 
       {/* Graph */}
+      {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
       <ForceGraph2D
-        ref={graphRef}
-        graphData={graphData}
-        nodeLabel={(node: any) => node.label}
-        nodeColor="color"
-        nodeRelSize={8}
-        linkDistance={80}
-        linkStrength={0.3}
-        linkDirectionalArrowLength={4}
-        linkDirectionalArrowRelPos={1}
-        linkCurvature={0.15}
-        linkLabel="type"
-        d3AlphaDecay={0.015}
-        d3VelocityDecay={0.4}
-        chargeStrength={-200}
-        cooldownTicks={200}
-        warmupTicks={0}
-        onNodeClick={(node: any) => {
-          if (onNodeClick) {
-            onNodeClick(node.id);
-          }
-        }}
-        backgroundColor="#0f172a00"
-        linkColor={() => '#475569'}
-        nodeCanvasObjectMode={() => 'after'}
-        nodeCanvasObject={(node: any, ctx: CanvasRenderingContext2D) => {
-          // Draw node label (filename)
-          const label = node.label || node.id;
-          const fontSize = 11;
-          ctx.font = `${fontSize}px Inter, sans-serif`;
-          ctx.textAlign = 'center';
-          ctx.textBaseline = 'middle';
-          ctx.fillStyle = '#e2e8f0';
-          ctx.fillText(label.length > 25 ? label.substring(0, 22) + '...' : label, node.x, node.y + 18);
-        }}
+        {...({
+          ref: graphRef,
+          graphData: graphData,
+          nodeLabel: (node: any) => node.label,
+          nodeColor: 'color',
+          nodeRelSize: 8,
+          linkDistance: 80,
+          linkStrength: 0.3,
+          linkDirectionalArrowLength: 4,
+          linkDirectionalArrowRelPos: 1,
+          linkCurvature: 0.15,
+          linkLabel: 'type',
+          d3AlphaDecay: 0.015,
+          d3VelocityDecay: 0.4,
+          chargeStrength: -200,
+          cooldownTicks: 200,
+          warmupTicks: 0,
+          onNodeClick: (node: any) => {
+            if (onNodeClick) {
+              onNodeClick(node.id);
+            }
+          },
+          backgroundColor: '#0f172a00',
+          linkColor: () => '#475569',
+          nodeCanvasObjectMode: () => 'after',
+          nodeCanvasObject: (node: any, ctx: CanvasRenderingContext2D) => {
+            const label = node.label || node.id;
+            const fontSize = 11;
+            ctx.font = `${fontSize}px Inter, sans-serif`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillStyle = '#e2e8f0';
+            ctx.fillText(label.length > 25 ? label.substring(0, 22) + '...' : label, node.x, node.y + 18);
+          },
+        } as any)}
       />
 
       {/* Stats */}

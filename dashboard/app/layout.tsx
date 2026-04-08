@@ -9,6 +9,12 @@ export const metadata: Metadata = {
   description: 'Visual management dashboard for RAGMcp server',
 };
 
+// Force dynamic rendering globally — this dashboard is auth-protected and reads
+// live SQLite data, so static prerendering makes no sense. This also avoids
+// the styled-jsx readlink EISDIR bug in Next.js 15 static gen on Windows.
+export const dynamic = 'force-dynamic';
+
+
 export default function RootLayout({
   children,
 }: {

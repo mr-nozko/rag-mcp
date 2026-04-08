@@ -30,6 +30,7 @@ export default function LogsTable({ logs }: Props) {
       'vector': 'bg-sky-500/10 text-sky-400 border-sky-500/20',
       'hybrid': 'bg-purple-500/10 text-purple-400 border-purple-500/20',
       'keyword': 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+      'pageindex_reasoning': 'bg-fuchsia-500/10 text-fuchsia-400 border-fuchsia-500/20 shadow-sm shadow-fuchsia-500/20',
     };
     return methodMap[method?.toLowerCase() || ''] || 'bg-slate-700/50 text-slate-400 border-slate-600';
   }

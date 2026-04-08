@@ -65,3 +65,13 @@ export interface DocumentDetails extends Document {
   chunks: Chunk[];
   relations: EntityRelation[];
 }
+
+export interface PageIndexStats {
+  indexedDocs: number;
+  eligibleDocs: number;
+  avgTreeNodes: number;
+  queriesToday: number;
+  avgIterations: number;
+  avgLatencyMs: number;
+  isHealthy: boolean | null;
+}

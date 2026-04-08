@@ -25,7 +25,7 @@ export default function DocumentViewer({ documentId }: Props) {
         setLoading(true);
         setError(null);
         
-        const response = await fetch(`/api/documents/${encodeURIComponent(documentId)}`);
+        const response = await fetch(`/api/documents/${encodeURIComponent(documentId as string)}`);
         
         if (!response.ok) {
           throw new Error('Failed to fetch document');

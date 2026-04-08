@@ -3,6 +3,7 @@ import { getIndexStats, getNamespaceDistribution, getRecentQueries } from '@/lib
 import StatsCard from '@/components/StatsCard';
 import NamespaceTable from '@/components/NamespaceTable';
 import LogsTable from '@/components/LogsTable';
+import PageIndexPanel from '@/components/PageIndexPanel';
 import RefreshButton from '@/components/RefreshButton';
 import TimeFilter from '@/components/TimeFilter';
 import { isValidTimePeriod, type TimePeriod } from '@/lib/time-utils';
@@ -25,6 +26,7 @@ export default async function DashboardPage({ searchParams }: PageProps) {
   const indexStats = getIndexStats(period);
   const namespaces = getNamespaceDistribution(period);
   const logs = getRecentQueries(10, period);
+  const pageIndexStats = await import('@/lib/queries').then(m => m.getPageIndexStats());
 
   return (
     <div className="p-8">
@@ -57,6 +59,13 @@ export default async function DashboardPage({ searchParams }: PageProps) {
             color="amber" 
           />
         </div>
+
+        {/* PageIndex Conditional Panel */}
+        {pageIndexStats && (
+          <div className="mb-10">
+            <PageIndexPanel data={pageIndexStats} />
+          </div>
+        )}
 
         {/* Main Content Grid */}
         <div className="grid grid-cols-1 xl:grid-cols-5 gap-8">
