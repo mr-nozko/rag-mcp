@@ -63,6 +63,7 @@ openssl rand -base64 32
 
 - Rust 1.71 or higher (`rustup update stable`)
 - OpenAI API key (for embedding generation)
+- Python 3.9+ (required for PageIndex reasoning engine)
 - Node.js 18+ (optional, for the visual dashboard only)
 
 ### Installation
@@ -86,6 +87,9 @@ cargo build --release
 
 # (Optional) Install dashboard dependencies
 cd dashboard && npm install && cd ..
+
+# Install PageIndex sidecar dependencies
+cd pageindex_sidecar && pip install -r requirements.txt && cd ..
 ```
 
 ### Configuration
@@ -228,6 +232,16 @@ cargo run --bin embed
 cargo run --bin embed -- --force
 ```
 
+### Step 3: PageIndex Reasoning (Tree-of-Contents)
+
+To enable structural reasoning over long documents, you must first generate the PageIndex "Reasoning Trees" (ToCs).
+
+```bash
+# Batch index all valid text documents into PageIndex trees
+cargo run --bin ragmcp index-pageindex
+```
+*Note: This utilizes `gpt-5.4-nano` (default) to deeply analyze each document's hierarchy.*
+
 ### Step 3: Test Search
 
 ```bash
@@ -335,15 +349,15 @@ Hybrid search (BM25 + vector) across your documentation.
 - `min_score` (optional, default: 0.25): Minimum relevance score (0-1)
 - `overfetch` (optional, 1-100): Fetch raw fused results before score thresholding (advanced RAG use)
 
-#### `ragmcp_reason` (Module 16)
+#### `ragmcp_reason`
 Advanced reasoning-based retrieval mapping for long or nested documents.
 **Parameters**:
 - `query` (required): The complex question to reason about
-- `doc_path` (optional): Specific document path. If omitted, uses hybrid search to find best candidate.
+- `doc_path` (optional): Specific document path. If omitted, uses hybrid search to find the best candidate.
 - `max_iterations` (optional, default: 5): Reasoning steps
-- `model` (optional, default: "gpt-4o-mini"): OpenAI reasoning model
+- `model` (optional, default: "gpt-5.4-nano"): Reasoning model (offline sidecar)
 
-**Behavior**: Navigates document structure (ToC) using LLM reasoning; requires sidecar (run with `--reasoning`).
+**Behavior**: Navigates document structure (ToC) using LLM reasoning; requires sidecar (run server with `--reasoning` or `--pageindex`). If no `doc_path` is provided, the system performs a hybrid search first to identify the most relevant document to reason within.
 
 **Example**:
 ```json
@@ -531,11 +545,11 @@ You can run the PageIndex reasoning engine locally using [Ollama](https://ollama
     OPENAI_BASE_URL=http://localhost:11434/v1
     OPENAI_API_KEY=ollama
     ```
-3.  **Run with flag**:
+3.  **Run normally**:
     ```bash
-    cargo run --bin ragmcp serve -- --reasoning
+    cargo run --bin ragmcp serve -- --pageindex
     ```
-The system will now use your local model for the reasoning steps. Note that OpenAI embeddings are still recommended for the initial hybrid search due to their high performance and low cost.
+The Python sidecar will automatically pick up `OPENAI_BASE_URL` from your `.env` (passed via the Rust host) and route reasoning queries through your local Ollama instance while keeping embeddings on OpenAI.
 
 ---
 
