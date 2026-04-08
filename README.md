@@ -34,6 +34,8 @@ openssl rand -base64 32
 - **Local-First**: SQLite-based with zero external dependencies after setup
 - **High Performance**: <1s P95 latency, optimized Rust implementation
 - **Advanced RAG Support**: Optional `overfetch` parameter for fetching larger candidate sets
+- **Reasoning Retrieval**: PageIndex integration for deep structural answers in long or nested documents (Enabled via `--reasoning` flag)
+- **Token-Saving Mode**: Run PageIndex reasoning locally via **Ollama** to eliminate API costs for complex documents.
 
 ### Write Capabilities
 - **Document Creation**: Create new documents via MCP with automatic indexing and embedding generation
@@ -247,8 +249,8 @@ RAGMcp supports two transport modes:
 
 ```bash
 cargo run --bin ragmcp serve
-# or with the release binary:
-./target/release/ragmcp serve
+# or for reasoning support:
+cargo run --bin ragmcp serve -- --reasoning
 ```
 
 Configure your app (Claude Desktop example) (`claude_desktop_config.json`):
@@ -274,6 +276,8 @@ See `claude_desktop_config.json.example` for a template.
 ```bash
 # Set RAGMCP_API_KEY in .env, then:
 cargo run --bin ragmcp serve-http
+# with reasoning support:
+cargo run --bin ragmcp serve-http -- --reasoning
 # Server starts on http://localhost:8081
 ```
 
@@ -330,6 +334,16 @@ Hybrid search (BM25 + vector) across your documentation.
 - `agent_filter` (optional): Filter by specific agent name
 - `min_score` (optional, default: 0.25): Minimum relevance score (0-1)
 - `overfetch` (optional, 1-100): Fetch raw fused results before score thresholding (advanced RAG use)
+
+#### `ragmcp_reason` (Module 16)
+Advanced reasoning-based retrieval mapping for long or nested documents.
+**Parameters**:
+- `query` (required): The complex question to reason about
+- `doc_path` (optional): Specific document path. If omitted, uses hybrid search to find best candidate.
+- `max_iterations` (optional, default: 5): Reasoning steps
+- `model` (optional, default: "gpt-4o-mini"): OpenAI reasoning model
+
+**Behavior**: Navigates document structure (ToC) using LLM reasoning; requires sidecar (run with `--reasoning`).
 
 **Example**:
 ```json
@@ -506,6 +520,22 @@ Use `ragmcp_list` with `list_type=namespaces` to discover all available namespac
 | Incremental update | < 5s per document |
 | Precision@5 | > 85% |
 | Recall@10 | > 90% |
+
+## Using Ollama for Reasoning (Free Mode)
+
+You can run the PageIndex reasoning engine locally using [Ollama](https://ollama.com) to avoid OpenAI API costs for document indexing and tree-traversal queries.
+
+1.  **Install Ollama** and pull a model (e.g., `llama3` or `llama3.1`).
+2.  **Configure `.env`**:
+    ```bash
+    OPENAI_BASE_URL=http://localhost:11434/v1
+    OPENAI_API_KEY=ollama
+    ```
+3.  **Run with flag**:
+    ```bash
+    cargo run --bin ragmcp serve -- --reasoning
+    ```
+The system will now use your local model for the reasoning steps. Note that OpenAI embeddings are still recommended for the initial hybrid search due to their high performance and low cost.
 
 ---
 

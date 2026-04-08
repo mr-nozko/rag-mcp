@@ -5,6 +5,7 @@ use crate::error::{Result, RagmcpError};
 use crate::mcp::tools;
 use crate::mcp::types::*;
 use crate::cache::ChunkEmbeddingCache;
+use crate::pageindex::PageIndexManager;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
@@ -15,6 +16,7 @@ pub struct McpServer {
     embedder: OpenAIEmbedder,
     config: Config,
     chunk_cache: Option<Arc<ChunkEmbeddingCache>>,
+    pageindex: Option<Arc<PageIndexManager>>,
 }
 
 impl McpServer {
@@ -24,12 +26,14 @@ impl McpServer {
         embedder: OpenAIEmbedder,
         config: Config,
         chunk_cache: Option<Arc<ChunkEmbeddingCache>>,
+        pageindex: Option<Arc<PageIndexManager>>,
     ) -> Self {
         Self {
             db,
             embedder,
             config,
             chunk_cache,
+            pageindex,
         }
     }
 
@@ -233,7 +237,7 @@ impl McpServer {
 
     /// Handle tools/list request
     async fn handle_tools_list(&self, id: &JsonRpcId) -> Result<JsonRpcResponse> {
-        let tools = tools::get_tool_definitions();
+        let tools = tools::get_tool_definitions(self.pageindex.is_some());
         let result = ToolsListResult { tools };
 
         Ok(JsonRpcResponse {
@@ -290,6 +294,7 @@ impl McpServer {
                     &self.config,
                     self.chunk_cache.clone(),
                     &params.arguments,
+                    self.pageindex.clone(),
                 )
                 .await?
             }
@@ -300,8 +305,34 @@ impl McpServer {
                     &self.config,
                     self.chunk_cache.clone(),
                     &params.arguments,
+                    self.pageindex.clone(),
                 )
                 .await?
+            }
+            "ragmcp_reason" => {
+                if let Some(pi) = &self.pageindex {
+                    tools::handle_reason(
+                        &self.db,
+                        &self.embedder,
+                        &self.config,
+                        pi.clone(),
+                        &params.arguments,
+                        self.chunk_cache.clone(),
+                    )
+                    .await?
+                } else {
+                     return Ok(JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id: id.clone().into(),
+                        payload: JsonRpcResponsePayload::Error {
+                            error: JsonRpcError {
+                                code: error_codes::INVALID_PARAMS,
+                                message: "PageIndex reasoning is not enabled. Launch with --reasoning to use this tool.".to_string(),
+                                data: None,
+                            },
+                        },
+                    });
+                }
             }
             _ => {
                 return Ok(JsonRpcResponse {

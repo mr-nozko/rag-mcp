@@ -3,6 +3,7 @@ use ragmcp::cache::{ChunkEmbeddingCache, EmbeddingCache};
 use ragmcp::db::{Db, migrate};
 use ragmcp::embeddings::OpenAIEmbedder;
 use ragmcp::mcp::{HttpMcpServer, McpServer};
+use ragmcp::pageindex::PageIndexManager;
 use std::path::Path;
 use std::sync::Arc;
 use anyhow::Result;
@@ -94,11 +95,17 @@ async fn main() -> Result<()> {
     match command {
         "serve" => {
             // MCP server mode (stdio transport)
-            run_mcp_server().await?;
+            let reasoning_enabled = args.iter().any(|arg| arg == "--reasoning" || arg == "--pageindex");
+            run_mcp_server(reasoning_enabled).await?;
         }
         "serve-http" => {
             // HTTP server mode (for custom connectors)
-            run_http_server().await?;
+            let reasoning_enabled = args.iter().any(|arg| arg == "--reasoning" || arg == "--pageindex");
+            run_http_server(reasoning_enabled).await?;
+        }
+        "index-pageindex" => {
+            // Offline batch indexer for PageIndex ToCs
+            run_pageindex_indexer().await?;
         }
         "verify" | _ => {
             // Default: verify database schema
@@ -110,7 +117,7 @@ async fn main() -> Result<()> {
 }
 
 /// Run MCP server (stdio transport)
-async fn run_mcp_server() -> Result<()> {
+async fn run_mcp_server(reasoning: bool) -> Result<()> {
     print_startup_banner();
 
     // Load configuration
@@ -128,15 +135,23 @@ async fn run_mcp_server() -> Result<()> {
     let embedder = build_embedder(&config)?;
     let chunk_cache = Some(Arc::new(ChunkEmbeddingCache::new()));
 
+    // Optional PageIndex Reasoning sidecar
+    let mut pageindex = None;
+    if reasoning {
+        let mut pi_manager = PageIndexManager::new(8181);
+        pi_manager.start(8181).await?;
+        pageindex = Some(Arc::new(pi_manager));
+    }
+
     // Create and run MCP server (stdio transport)
-    let mut server = McpServer::new(db, embedder, config, chunk_cache);
+    let mut server = McpServer::new(db, embedder, config, chunk_cache, pageindex);
     server.run().await?;
     
     Ok(())
 }
 
 /// Run HTTP MCP server
-async fn run_http_server() -> Result<()> {
+async fn run_http_server(reasoning: bool) -> Result<()> {
     print_startup_banner();
 
     log::info!("Starting RAGMcp HTTP Server v{}", env!("CARGO_PKG_VERSION"));
@@ -158,10 +173,93 @@ async fn run_http_server() -> Result<()> {
     let embedder = build_embedder(&config)?;
     let chunk_cache = Some(Arc::new(ChunkEmbeddingCache::new()));
 
+    // Optional PageIndex Reasoning sidecar
+    let mut pageindex = None;
+    if reasoning {
+        let mut pi_manager = PageIndexManager::new(8181);
+        pi_manager.start(8181).await?;
+        pageindex = Some(Arc::new(pi_manager));
+    }
+
     // Create and run HTTP MCP server (custom connector / Cloudflare Tunnel transport)
-    let http_server = HttpMcpServer::new(db, embedder, config.clone(), chunk_cache)?;
+    let http_server = HttpMcpServer::new(db, embedder, config.clone(), chunk_cache, pageindex)?;
     http_server.run(config.http_server.port).await?;
     
+    Ok(())
+}
+
+/// Run PageIndex offline indexer
+async fn run_pageindex_indexer() -> Result<()> {
+    print_startup_banner();
+    log::info!("Starting PageIndex Batch Indexer...");
+    
+    let config = Config::load()?;
+    let db = Db::new(config.db_path());
+    let migrations_dir = Path::new("migrations");
+    db.with_connection(|conn| {
+        ragmcp::db::migrate::run_migrations(conn, migrations_dir)
+    }).await?;
+    
+    if !config.pageindex.enabled {
+        log::warn!("[pageindex] config.pageindex.enabled is false but continuing because index-pageindex was invoked explicitly.");
+    }
+    
+    let mut pi_manager = PageIndexManager::new(config.pageindex.sidecar_port);
+    pi_manager.start(config.pageindex.sidecar_port).await?;
+    
+    // Fetch all documents from db that match eligible extensions
+    let docs = db.with_connection(|conn| {
+        let mut stmt = conn.prepare("SELECT doc_id, doc_path FROM documents")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut result = Vec::new();
+        for r in rows {
+            if let Ok(d) = r {
+                result.push(d);
+            }
+        }
+        Ok::<_, ragmcp::error::RagmcpError>(result)
+    }).await?;
+    
+    let mut indexed = 0;
+    for (doc_id, doc_path) in docs {
+        let ext = std::path::Path::new(&doc_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+            
+        if config.pageindex.eligible_extensions.contains(&ext) {
+            log::info!("Indexing document: {}", doc_path);
+            let index_result = pi_manager.index_document(&doc_path, &config.pageindex.default_model).await;
+            match index_result {
+                Ok(resp) => {
+                    let node_count = resp.node_count.unwrap_or(0);
+                    log::info!("Indexed {}: {} nodes (status: {})", doc_path, node_count, resp.status);
+                    
+                    let doc_path_clone = doc_path.clone();
+                    let model_clone = config.pageindex.default_model.clone();
+                    let tree_path = resp.tree_path;
+                    
+                    let _ = db.with_connection(move |conn| {
+                        conn.execute(
+                            "INSERT OR REPLACE INTO pageindex_index (doc_id, doc_path, tree_path, tree_built_at, tree_node_count, model_used) VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, ?)",
+                            rusqlite::params![doc_id, doc_path_clone, tree_path, node_count, model_clone]
+                        )?;
+                        Ok::<_, ragmcp::error::RagmcpError>(())
+                    }).await;
+                    indexed += 1;
+                }
+                Err(e) => {
+                    log::error!("Failed to index {}: {}", doc_path, e);
+                }
+            }
+        }
+    }
+    
+    pi_manager.shutdown().await;
+    log::info!("PageIndex Batch Indexer complete. Successfully processed {} documents.", indexed);
     Ok(())
 }
 

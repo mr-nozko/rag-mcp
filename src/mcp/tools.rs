@@ -21,8 +21,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 /// Get all tool definitions for tools/list
-pub fn get_tool_definitions() -> Vec<Tool> {
-    vec![
+pub fn get_tool_definitions(pageindex_enabled: bool) -> Vec<Tool> {
+    let mut tools = vec![
         Tool {
             name: "ragmcp_search".to_string(),
             description: "Hybrid search across documentation using BM25 and vector similarity".to_string(),
@@ -200,7 +200,42 @@ pub fn get_tool_definitions() -> Vec<Tool> {
                 "required": ["doc_path", "content"]
             }),
         },
-    ]
+    ];
+
+    if pageindex_enabled {
+        tools.push(Tool {
+            name: "ragmcp_reason".to_string(),
+            description: "Advanced reasoning-based retrieval mapping for long or nested documents. Use this when simple keyword search (ragmcp_search) fails to find complex structural answers.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The complex question to reason about within the document structure"
+                    },
+                    "doc_path": {
+                        "type": "string",
+                        "description": "Optional specific document path to reason within. If omitted, will attempt to identify target via search first."
+                    },
+                    "max_iterations": {
+                        "type": "integer",
+                        "description": "Maximum reasoning steps",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 10
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "OpenAI model to use (default: gpt-4o-mini)",
+                        "default": "gpt-4o-mini"
+                    }
+                },
+                "required": ["query"]
+            }),
+        });
+    }
+
+    tools
 }
 
 /// Search parameters
@@ -801,6 +836,7 @@ pub async fn handle_create_doc(
     config: &Config,
     _cache: Option<Arc<ChunkEmbeddingCache>>,
     arguments: &Value,
+    pageindex: Option<Arc<crate::pageindex::PageIndexManager>>,
 ) -> Result<ToolsCallResult> {
     let params: CreateDocParams = serde_json::from_value(arguments.clone())
         .map_err(|e| RagmcpError::InvalidInput(format!("Invalid parameters: {}", e)))?;
@@ -897,6 +933,28 @@ pub async fn handle_create_doc(
     })
     .to_string();
 
+    if let Some(pi) = pageindex {
+        let pi_clone = pi.clone();
+        let path_clone = params.doc_path.clone();
+        let doc_id_clone = doc_id.clone();
+        let db_path = config.db_path().to_path_buf();
+        let model_clone = config.pageindex.default_model.clone();
+        tokio::spawn(async move {
+            let db = crate::db::Db::new(&db_path);
+            if let Ok(resp) = pi_clone.index_document(&path_clone, &model_clone).await {
+                let node_count = resp.node_count.unwrap_or(0);
+                let tree_path = resp.tree_path;
+                let _ = db.with_connection(move |conn| {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO pageindex_index (doc_id, doc_path, tree_path, tree_built_at, tree_node_count, model_used) VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, ?)",
+                        rusqlite::params![doc_id_clone, path_clone, tree_path, node_count, model_clone]
+                    )?;
+                    Ok::<_, RagmcpError>(())
+                }).await;
+            }
+        });
+    }
+
     Ok(ToolsCallResult {
         content: vec![ContentItem {
             content_type: "text".to_string(),
@@ -920,6 +978,7 @@ pub async fn handle_update_doc(
     config: &Config,
     _cache: Option<Arc<ChunkEmbeddingCache>>,
     arguments: &Value,
+    pageindex: Option<Arc<crate::pageindex::PageIndexManager>>,
 ) -> Result<ToolsCallResult> {
     let params: UpdateDocParams = serde_json::from_value(arguments.clone())
         .map_err(|e| RagmcpError::InvalidInput(format!("Invalid parameters: {}", e)))?;
@@ -996,6 +1055,28 @@ pub async fn handle_update_doc(
     })
     .to_string();
 
+    if let Some(pi) = pageindex {
+        let pi_clone = pi.clone();
+        let path_clone = params.doc_path.clone();
+        let doc_id_clone = doc_id.clone();
+        let db_path = config.db_path().to_path_buf();
+        let model_clone = config.pageindex.default_model.clone();
+        tokio::spawn(async move {
+            let db = crate::db::Db::new(&db_path);
+            if let Ok(resp) = pi_clone.index_document(&path_clone, &model_clone).await {
+                let node_count = resp.node_count.unwrap_or(0);
+                let tree_path = resp.tree_path;
+                let _ = db.with_connection(move |conn| {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO pageindex_index (doc_id, doc_path, tree_path, tree_built_at, tree_node_count, model_used) VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, ?)",
+                        rusqlite::params![doc_id_clone, path_clone, tree_path, node_count, model_clone]
+                    )?;
+                    Ok::<_, RagmcpError>(())
+                }).await;
+            }
+        });
+    }
+
     Ok(ToolsCallResult {
         content: vec![ContentItem {
             content_type: "text".to_string(),
@@ -1045,4 +1126,144 @@ async fn log_query(
     }).await?;
 
     Ok(())
+}
+
+/// Log pageindex query to pageindex_query_logs table
+async fn log_pageindex_query(
+    db: &Db,
+    query_text: &str,
+    doc_path: &str,
+    result: &crate::pageindex::manager::QueryResponse,
+    latency_ms: u64,
+    model_used: &str,
+) -> Result<()> {
+    let query_id = Uuid::new_v4().to_string();
+    
+    // Extract node_ids from retrieved_sections
+    let mut node_ids = Vec::new();
+    for section in &result.retrieved_sections {
+        if let Some(node_id) = section.get("node_id") {
+            if let Some(s) = node_id.as_str() {
+                node_ids.push(s.to_string());
+            }
+        }
+    }
+    let node_ids_json = serde_json::to_string(&node_ids)
+        .map_err(|e| RagmcpError::Config(format!("JSON serialization error: {}", e)))?;
+
+    let query_text = query_text.to_string();
+    let doc_path = doc_path.to_string();
+    let model_used = model_used.to_string();
+    let query_id_clone = query_id.clone();
+    let node_ids_json_clone = node_ids_json.clone();
+    let iterations = result.iterations as i32;
+    let latency_ms = latency_ms as i32;
+
+    db.with_connection(move |conn| {
+        conn.execute(
+            r#"
+            INSERT INTO pageindex_query_logs (
+                query_id, query_text, doc_path,
+                iterations, retrieved_node_ids, latency_ms, model_used
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+            rusqlite::params![
+                query_id_clone,
+                query_text,
+                doc_path,
+                iterations,
+                node_ids_json_clone,
+                latency_ms,
+                model_used
+            ]
+        )?;
+        Ok::<_, RagmcpError>(())
+    }).await?;
+
+    Ok(())
+}
+
+
+/// Params for ragmcp_reason
+#[derive(Debug, Deserialize)]
+struct ReasonParams {
+    query: String,
+    doc_path: Option<String>,
+    #[serde(default = "default_max_iterations")]
+    max_iterations: u8,
+    #[serde(default = "default_reason_model")]
+    model: String,
+}
+
+fn default_max_iterations() -> u8 { 5 }
+fn default_reason_model() -> String { "gpt-4o-mini".to_string() }
+
+/// Handle ragmcp_reason tool (PageIndex reasoning)
+pub async fn handle_reason(
+    db: &Db,
+    embedder: &OpenAIEmbedder,
+    _config: &Config,
+    pi: Arc<crate::pageindex::PageIndexManager>,
+    arguments: &Value,
+    chunk_cache: Option<Arc<ChunkEmbeddingCache>>,
+) -> Result<ToolsCallResult> {
+    let params: ReasonParams = serde_json::from_value(arguments.clone())
+        .map_err(|e| RagmcpError::Config(format!("Invalid reason params: {}", e)))?;
+
+    let doc_path = if let Some(path) = params.doc_path {
+        path
+    } else {
+        // Fallback: search for the best document candidate first
+        log::info!("[pageindex] No doc_path provided, searching for candidate...");
+        let search_results = search_hybrid(
+            db,
+            embedder,
+            &params.query,
+            None,
+            None,
+            1,
+            0.5,
+            0.5,
+            0.5,
+            chunk_cache,
+        ).await?;
+
+        if let Some(top) = search_results.first() {
+            log::info!("[pageindex] Selected candidate: {}", top.doc_path);
+            top.doc_path.clone()
+        } else {
+            return Ok(ToolsCallResult {
+                content: vec![ContentItem {
+                    content_type: "text".to_string(),
+                    text: "No relevant documents found to reason within. Please provide a doc_path or a more specific query.".to_string(),
+                }],
+                is_error: Some(true),
+            });
+        }
+    };
+
+    let start = std::time::Instant::now();
+    let result = pi.query(&doc_path, &params.query, &params.model, params.max_iterations).await
+        .map_err(|e| RagmcpError::Config(format!("Reasoning failed: {}", e)))?;
+    let duration = start.elapsed().as_millis() as u64;
+
+    // Log the pageindex query telemetry
+    let _ = log_pageindex_query(db, &params.query, &doc_path, &result, duration, &params.model).await;
+
+    let result_text = format!(
+        "Reasoning Result for: {}\n\n\"{}\"\n\nMethod: PageIndex Reasoning\nIterations: {}\nLatency: {}ms (Sidecar)\nTotal Latency: {}ms",
+        doc_path,
+        result.answer,
+        result.iterations,
+        result.latency_ms,
+        duration
+    );
+
+    Ok(ToolsCallResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text: result_text,
+        }],
+        is_error: None,
+    })
 }

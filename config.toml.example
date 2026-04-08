@@ -77,3 +77,14 @@ allowed_origins = [
 # Authless mode: If true, no authentication required (public access)
 # Recommended for testing or if using Cloudflare Tunnel with additional security
 authless = true
+
+[pageindex]
+enabled = false
+sidecar_port = 8181
+sidecar_startup_timeout_ms = 10000
+default_model = "gpt-5.4-nano"
+max_iterations = 5
+tree_cache_dir = "./ragmcp_data/pageindex"
+rebuild_on_update = true
+index_on_startup = true
+eligible_extensions = ["md", "pdf", "txt"]

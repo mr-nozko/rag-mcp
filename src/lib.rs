@@ -7,6 +7,7 @@ pub mod embeddings;
 pub mod mcp;
 pub mod cache;
 pub mod graph;
+pub mod pageindex;
 pub mod watch;
 pub mod eval;
 

@@ -37,3 +37,7 @@ Thumbs.db
 .cursor/*
 .cursorrules
 .cursor
+
+# PageIndex Data
+ragmcp_data/
+src/pageindex/tocs/*

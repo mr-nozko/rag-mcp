@@ -49,20 +49,20 @@ pub fn sanitize_fts5_query(query: &str) -> String {
         .collect();
     
     if terms.is_empty() {
-        // If all terms were filtered, use original cleaned query (fallback)
-        return cleaned.replace('"', "\"\"");
+        // If all terms were filtered, use original cleaned query wrapped in quotes (fallback)
+        return format!("\"{}\"", cleaned.replace('"', "\"\""));
     }
     
     if terms.len() == 1 {
-        // Single term: just escape quotes
-        return terms[0].replace('"', "\"\"");
+        // Single term
+        return format!("\"{}\"", terms[0].replace('"', "\"\""));
     }
     
     // Multiple terms: format as OR query for better recall
-    // Escape double quotes in each term
+    // Escape double quotes in each term and securely wrap in quotes to prevent punctuation syntax errors
     let escaped_terms: Vec<String> = terms
         .iter()
-        .map(|t| t.replace('"', "\"\""))
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
         .collect();
     
     escaped_terms.join(" OR ")
@@ -278,33 +278,33 @@ mod tests {
         // Test double quote escaping
         assert_eq!(
             sanitize_fts5_query(r#"test "quoted" text"#),
-            r#"test OR ""quoted"" OR text"#
+            r#""test" OR """quoted""" OR "text""#
         );
         
         // Test multiple quotes
         // Note: stop word "and" is removed; remaining terms use OR for better recall
         assert_eq!(
             sanitize_fts5_query(r#""quoted" and "another""#),
-            r#"""quoted"" OR ""another"""#
+            r#""""quoted""" OR """another""""#
         );
         
         // Test with other special characters (should be removed to avoid FTS5 syntax issues)
         assert_eq!(
             sanitize_fts5_query("test* (query) {terms}"),
-            "test OR query OR terms"
+            r#""test" OR "query" OR "terms""#
         );
         
         // Test empty string
-        assert_eq!(sanitize_fts5_query(""), "");
+        assert_eq!(sanitize_fts5_query(""), "\"\"");
 
         // FTS5 treats '-' as "exclude term" and throws "syntax error near '-'"; we strip it
-        assert_eq!(sanitize_fts5_query("--agent_filter"), "agent_filter");
-        assert_eq!(sanitize_fts5_query("well-known term"), "wellknown OR term");
+        assert_eq!(sanitize_fts5_query("--agent_filter"), "\"agent_filter\"");
+        assert_eq!(sanitize_fts5_query("well-known term"), "\"wellknown\" OR \"term\"");
 
         // FTS5 throws "syntax error near \"'\"" when apostrophe is in query; we strip it
         assert_eq!(
             sanitize_fts5_query("What are Alpha's NonNegotiables?"),
-            "Alphas OR NonNegotiables"
+            "\"Alphas\" OR \"NonNegotiables\""
         );
     }
     

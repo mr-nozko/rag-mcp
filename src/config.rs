@@ -11,6 +11,8 @@ pub struct Config {
     pub performance: PerformanceConfig,
     #[serde(default)]
     pub http_server: HttpServerConfig,
+    #[serde(default)]
+    pub pageindex: PageIndexConfig,
 }
 
 /// RAGMcp-specific configuration
@@ -70,6 +72,57 @@ pub struct HttpServerConfig {
     pub allowed_origins: Vec<String>,
     #[serde(default = "default_authless")]
     pub authless: bool,
+}
+
+/// PageIndex configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct PageIndexConfig {
+    #[serde(default = "default_pi_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_pi_port")]
+    pub sidecar_port: u16,
+    #[serde(default = "default_pi_timeout")]
+    pub sidecar_startup_timeout_ms: u64,
+    #[serde(default = "default_pi_model")]
+    pub default_model: String,
+    #[serde(default = "default_pi_max_iter")]
+    pub max_iterations: u8,
+    #[serde(default = "default_pi_cache_dir")]
+    pub tree_cache_dir: String,
+    #[serde(default = "default_pi_rebuild")]
+    pub rebuild_on_update: bool,
+    #[serde(default = "default_pi_index_startup")]
+    pub index_on_startup: bool,
+    #[serde(default = "default_pi_extensions")]
+    pub eligible_extensions: Vec<String>,
+}
+
+fn default_pi_enabled() -> bool { false }
+fn default_pi_port() -> u16 { 8181 }
+fn default_pi_timeout() -> u64 { 10000 }
+fn default_pi_model() -> String { "gpt-5.4-nano".to_string() }
+fn default_pi_max_iter() -> u8 { 5 }
+fn default_pi_cache_dir() -> String { "./ragmcp_data/pageindex".to_string() }
+fn default_pi_rebuild() -> bool { true }
+fn default_pi_index_startup() -> bool { true }
+fn default_pi_extensions() -> Vec<String> {
+    vec!["md".to_string(), "pdf".to_string(), "txt".to_string()]
+}
+
+impl Default for PageIndexConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_pi_enabled(),
+            sidecar_port: default_pi_port(),
+            sidecar_startup_timeout_ms: default_pi_timeout(),
+            default_model: default_pi_model(),
+            max_iterations: default_pi_max_iter(),
+            tree_cache_dir: default_pi_cache_dir(),
+            rebuild_on_update: default_pi_rebuild(),
+            index_on_startup: default_pi_index_startup(),
+            eligible_extensions: default_pi_extensions(),
+        }
+    }
 }
 
 fn default_authless() -> bool {

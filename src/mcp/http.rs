@@ -48,6 +48,7 @@ impl HttpMcpServer {
         embedder: OpenAIEmbedder,
         config: Config,
         chunk_cache: Option<std::sync::Arc<crate::cache::ChunkEmbeddingCache>>,
+        pageindex: Option<std::sync::Arc<crate::pageindex::PageIndexManager>>,
     ) -> Result<Self> {
         // API key is optional if authless mode is enabled
         let api_key = if config.http_server.authless {
@@ -60,7 +61,7 @@ impl HttpMcpServer {
                 )))?
         };
 
-        let server = Arc::new(McpServer::new(db, embedder, config.clone(), chunk_cache));
+        let server = Arc::new(McpServer::new(db, embedder, config.clone(), chunk_cache, pageindex));
 
         Ok(Self {
             server,
