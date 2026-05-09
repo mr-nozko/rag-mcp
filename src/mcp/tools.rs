@@ -184,7 +184,7 @@ pub fn get_tool_definitions(pageindex_enabled: bool) -> Vec<Tool> {
         },
         Tool {
             name: "ragmcp_update_doc".to_string(),
-            description: "Update an existing document, re-parsing and re-embedding automatically. Creates parent directories if needed.".to_string(),
+            description: "Update an existing document by replacing specific snippets of text, re-parsing and re-embedding automatically. Creates parent directories if needed.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -192,12 +192,20 @@ pub fn get_tool_definitions(pageindex_enabled: bool) -> Vec<Tool> {
                         "type": "string",
                         "description": "Relative path of document to update"
                     },
-                    "content": {
-                        "type": "string",
-                        "description": "New content (full replacement)"
+                    "updates": {
+                        "type": "array",
+                        "description": "List of text replacements to apply. Each update replaces 'target_text' with 'replacement_text'. Must provide exact existing text to match.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "target_text": { "type": "string", "description": "Exact text in the document to replace" },
+                                "replacement_text": { "type": "string", "description": "New text to insert in place of target_text" }
+                            },
+                            "required": ["target_text", "replacement_text"]
+                        }
                     }
                 },
-                "required": ["doc_path", "content"]
+                "required": ["doc_path", "updates"]
             }),
         },
     ];
@@ -966,9 +974,15 @@ pub async fn handle_create_doc(
 
 /// Params for ragmcp_update_doc
 #[derive(Debug, Deserialize)]
+struct DocUpdate {
+    target_text: String,
+    replacement_text: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct UpdateDocParams {
     doc_path: String,
-    content: String,
+    updates: Vec<DocUpdate>,
 }
 
 /// Update an existing document: validate path, create dirs if needed, write file, re-parse, re-chunk, upsert, audit.
@@ -986,10 +1000,29 @@ pub async fn handle_update_doc(
     let validator = PathValidator::new(&config.ragmcp.rag_folder)?;
     let absolute_path = validator.validate_write_path(&params.doc_path)?;
 
+    // Read existing content
+    let mut current_content = if absolute_path.exists() {
+        fs::read_to_string(&absolute_path).unwrap_or_default()
+    } else {
+        return Err(RagmcpError::InvalidInput(format!("Cannot apply updates: File does not exist at {}", params.doc_path)));
+    };
+
+    for update in &params.updates {
+        if !current_content.contains(&update.target_text) {
+            // Return an error string with a preview of the target text that wasn't found
+            let preview: String = update.target_text.chars().take(50).collect();
+            return Err(RagmcpError::InvalidInput(format!(
+                "Target text not found in document: '{}...'", preview
+            )));
+        }
+        // Replace the first occurrence of target_text with replacement_text
+        current_content = current_content.replacen(&update.target_text, &update.replacement_text, 1);
+    }
+
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent).map_err(RagmcpError::Io)?;
     }
-    fs::write(&absolute_path, &params.content).map_err(RagmcpError::Io)?;
+    fs::write(&absolute_path, &current_content).map_err(RagmcpError::Io)?;
 
     let file_hash = compute_file_hash(&absolute_path)?;
     let metadata = fs::metadata(&absolute_path).map_err(RagmcpError::Io)?;
@@ -1003,7 +1036,7 @@ pub async fn handle_update_doc(
             .to_lowercase();
         let registry = ParserRegistry::new();
         let parsed = registry
-            .parse(&params.content, &params.doc_path, &extension)
+            .parse(&current_content, &params.doc_path, &extension)
             .map_err(|e| RagmcpError::Parse(e.to_string()))?;
         let doc_type = parsed.doc_type.clone();
         let namespace = extract_namespace(&params.doc_path);
