@@ -6,7 +6,7 @@ use crate::mcp::server::McpServer;
 use crate::mcp::types::*;
 use axum::{
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response, sse::{Event, KeepAlive, Sse}, Redirect},
     routing::{get, post},
     Json, Router, Form,
@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::convert::Infallible;
 use std::collections::HashMap;
 use std::sync::Mutex;
-use futures_util::{Stream, stream};
+use futures_util::stream;
 use tokio_stream::{StreamExt as TokioStreamExt, wrappers::IntervalStream};
 use tokio::sync::mpsc;
 use tower::ServiceBuilder;
@@ -154,7 +154,8 @@ impl HttpMcpServer {
                 .allow_headers(Any)
         };
 
-        Router::new()
+        // Core MCP routes always available (authless or authenticated).
+        let mut router = Router::new()
             .route("/sse", get(handle_sse))  // SSE endpoint for Claude
             .route("/mcp", post(handle_post))  // POST endpoint for JSON-RPC requests
             .route("/.well-known/mcp-server", get(handle_discovery))  // Discovery endpoint
@@ -164,12 +165,54 @@ impl HttpMcpServer {
                 ServiceBuilder::new()
                     .layer(TraceLayer::new_for_http())
                     .layer(cors)
-            )
-            .route("/.well-known/oauth-authorization-server", get(handle_oauth_discovery))
-            .route("/authorize", get(handle_authorize))
-            .route("/token", post(handle_token))
-            .with_state(AppState::new(server_state, api_key, allowed_origins, authless))
+            );
+
+        // OAuth surface only when auth is required (authless=false).
+        // Claude custom connectors discover PRM → AS metadata → DCR → authorize → token.
+        if !authless {
+            router = router
+                // RFC 9728 Protected Resource Metadata (root + /sse path form)
+                .route("/.well-known/oauth-protected-resource", get(handle_protected_resource))
+                .route("/.well-known/oauth-protected-resource/sse", get(handle_protected_resource))
+                .route("/.well-known/oauth-authorization-server", get(handle_oauth_discovery))
+                .route("/authorize", get(handle_authorize))
+                .route("/token", post(handle_token))
+                // RFC 7591 Dynamic Client Registration so Claude can auto-register
+                .route("/register", post(handle_register));
+        }
+
+        router.with_state(AppState::new(server_state, api_key, allowed_origins, authless))
     }
+}
+
+/// Fixed OAuth client ID shared by DCR responses and manual Claude Advanced settings.
+const OAUTH_CLIENT_ID: &str = "ragmcp-client";
+
+/// Claude hosted-surface redirect URIs (claude.ai and claude.com).
+const CLAUDE_REDIRECT_URIS: &[&str] = &[
+    "https://claude.ai/api/mcp/auth_callback",
+    "https://claude.com/api/mcp/auth_callback",
+];
+
+/// Derive issuer base URL from the Host header (HTTPS off-localhost).
+fn issuer_from_headers(headers: &HeaderMap) -> String {
+    headers
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .map(|host| {
+            let is_local = host.starts_with("localhost") || host.starts_with("127.0.0.1");
+            if is_local {
+                format!("http://{}", host)
+            } else {
+                format!("https://{}", host)
+            }
+        })
+        .unwrap_or_else(|| "http://localhost:8081".to_string())
+}
+
+/// True if redirect_uri is an allowed Claude MCP callback.
+fn is_allowed_claude_redirect(redirect_uri: &str) -> bool {
+    CLAUDE_REDIRECT_URIS.contains(&redirect_uri)
 }
 
 /// Application state shared across handlers
@@ -238,7 +281,7 @@ async fn handle_post(
         }
     }
 
-    // Validate Origin header (skip if authless mode)
+    // Validate Origin header (skip if authless mode or no allowlist configured)
     if !state.authless {
         if let Err(response) = validate_origin(&headers, &state.allowed_origins) {
             return response;
@@ -294,18 +337,21 @@ async fn handle_post(
 }
 
 /// Handle SSE (Server-Sent Events) endpoint for Claude
-/// This is the main endpoint Claude connects to for remote MCP servers
-/// Claude uses this endpoint to receive MCP responses and notifications
+/// This is the main endpoint Claude connects to for remote MCP servers.
+/// When auth is required, unauthenticated requests return 401 + WWW-Authenticate
+/// so Claude can discover OAuth Protected Resource Metadata and start the flow.
 async fn handle_sse(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Sse<impl Stream<Item = std::result::Result<Event, Infallible>>> {
-    // Validate authentication and origin (skip if authless mode)
-    // Note: For SSE, we continue even if validation fails to avoid breaking the stream
-    // The POST endpoint will enforce validation for actual requests
+) -> Response {
+    // Enforce Bearer auth in OAuth mode — 401 triggers Claude's OAuth discovery.
     if !state.authless {
-        let _ = validate_auth(&headers, &state.api_key);
-        let _ = validate_origin(&headers, &state.allowed_origins);
+        if let Err(response) = validate_auth(&headers, &state.api_key) {
+            return response;
+        }
+        if let Err(response) = validate_origin(&headers, &state.allowed_origins) {
+            return response;
+        }
     }
 
     // Per MCP spec (2024-11-05), SSE endpoint must immediately send an "endpoint" event
@@ -370,7 +416,7 @@ async fn handle_sse(
         .interval(Duration::from_secs(15))
         .text("ping");
 
-    Sse::new(combined_stream).keep_alive(keepalive)
+    Sse::new(combined_stream).keep_alive(keepalive).into_response()
 }
 
 /// Handle discovery endpoint (/.well-known/mcp-server or /.well-known/mcp.json)
@@ -393,10 +439,15 @@ async fn handle_discovery(State(state): State<AppState>) -> Response {
         }
     });
 
-    // If authless mode, indicate no authentication required
+    // Advertise auth mode clearly so clients do not probe incomplete OAuth in authless.
     if state.authless {
         discovery["authentication"] = serde_json::json!({
             "type": "none"
+        });
+    } else {
+        discovery["authentication"] = serde_json::json!({
+            "type": "oauth2",
+            "authorization_server": "/.well-known/oauth-authorization-server"
         });
     }
 
@@ -415,31 +466,32 @@ async fn handle_health() -> Response {
     ).into_response()
 }
 
+/// RFC 9728 Protected Resource Metadata.
+/// Tells Claude which authorization server protects this MCP resource (/sse).
+async fn handle_protected_resource(headers: HeaderMap) -> Response {
+    let issuer = issuer_from_headers(&headers);
+    // resource must match the connector URL users paste into Claude (…/sse)
+    let resource = format!("{}/sse", issuer);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "resource": resource,
+            "authorization_servers": [issuer],
+            "scopes_supported": ["claudeai"],
+            "bearer_methods_supported": ["header"]
+        }))
+    ).into_response()
+}
+
 /// Handle OAuth discovery endpoint (/.well-known/oauth-authorization-server)
 /// Returns OAuth 2.0 authorization server metadata per RFC 8414.
-///
-/// The issuer URL is derived dynamically from the incoming `Host` header so
-/// this works correctly for any hostname (local, Cloudflare Tunnel, custom domain)
-/// without requiring configuration.
+/// Includes registration_endpoint so Claude can perform Dynamic Client Registration.
 async fn handle_oauth_discovery(
     headers: HeaderMap,
     State(_state): State<AppState>,
 ) -> Response {
-    // Derive the issuer from the Host header sent by the client.
-    // - Use HTTPS for any host that is not localhost/127.0.0.1 (likely public).
-    // - Fall back to http://localhost:8081 if the header is missing (direct CLI calls).
-    let issuer = headers
-        .get("host")
-        .and_then(|h| h.to_str().ok())
-        .map(|host| {
-            let is_local = host.starts_with("localhost") || host.starts_with("127.0.0.1");
-            if is_local {
-                format!("http://{}", host)
-            } else {
-                format!("https://{}", host)
-            }
-        })
-        .unwrap_or_else(|| "http://localhost:8081".to_string());
+    let issuer = issuer_from_headers(&headers);
 
     (
         StatusCode::OK,
@@ -447,11 +499,54 @@ async fn handle_oauth_discovery(
             "issuer": issuer,
             "authorization_endpoint": format!("{}/authorize", issuer),
             "token_endpoint": format!("{}/token", issuer),
+            // RFC 7591 — Claude uses this when no Client ID is set in Advanced settings
+            "registration_endpoint": format!("{}/register", issuer),
             "grant_types_supported": ["authorization_code"],
             "response_types_supported": ["code"],
             "code_challenge_methods_supported": ["S256"],
             "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
             "scopes_supported": ["claudeai"]
+        }))
+    ).into_response()
+}
+
+/// RFC 7591 Dynamic Client Registration.
+/// Returns the fixed public client so Claude can complete OAuth without a pre-filled Client ID.
+async fn handle_register(
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    // Prefer redirect_uris from the registration request when they are Claude callbacks;
+    // otherwise fall back to the known Claude allowlist.
+    let redirect_uris: Vec<String> = body
+        .get("redirect_uris")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|u| u.as_str())
+                .filter(|u| is_allowed_claude_redirect(u))
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let redirect_uris = if redirect_uris.is_empty() {
+        CLAUDE_REDIRECT_URIS.iter().map(|s| (*s).to_string()).collect::<Vec<_>>()
+    } else {
+        redirect_uris
+    };
+
+    // Public client: Claude authenticates via PKCE only (token_endpoint_auth_method: none)
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "client_id": OAUTH_CLIENT_ID,
+            "client_id_issued_at": chrono::Utc::now().timestamp(),
+            "client_name": body.get("client_name").cloned().unwrap_or(serde_json::json!("Claude")),
+            "redirect_uris": redirect_uris,
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+            "code_challenge_methods": ["S256"]
         }))
     ).into_response()
 }
@@ -470,8 +565,8 @@ async fn handle_authorize(
     let code_challenge_method = params.get("code_challenge_method").cloned().unwrap_or("S256".to_string());
     let response_type = params.get("response_type").cloned().unwrap_or_default();
 
-    // Validate client_id
-    if client_id != "ragmcp-client" {
+    // Accept fixed Client ID (manual Advanced settings or DCR response)
+    if client_id != OAUTH_CLIENT_ID {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -492,8 +587,8 @@ async fn handle_authorize(
         ).into_response();
     }
 
-    // Validate redirect_uri (must be Claude's callback)
-    if redirect_uri != "https://claude.ai/api/mcp/auth_callback" {
+    // Allow both Claude hosted callback hosts (claude.ai and claude.com)
+    if !is_allowed_claude_redirect(&redirect_uri) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -555,8 +650,8 @@ async fn handle_token(
         ).into_response();
     }
 
-    // Validate client_id
-    if client_id != "ragmcp-client" {
+    // Accept fixed Client ID from DCR or Claude Advanced settings
+    if client_id != OAUTH_CLIENT_ID {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -566,8 +661,10 @@ async fn handle_token(
         ).into_response();
     }
 
-    // Validate client_secret matches API key
-    if client_secret != app_state.api_key {
+    // Public clients (DCR / token_endpoint_auth_method: none) send no secret — PKCE is the proof.
+    // Confidential clients may send client_secret matching RAGMCP_API_KEY.
+    let is_public_client = client_secret.is_empty();
+    if !is_public_client && client_secret != app_state.api_key {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -648,38 +745,58 @@ async fn handle_token(
     ).into_response()
 }
 
+/// Build a 401 that points Claude at Protected Resource Metadata (RFC 9728).
+fn unauthorized_bearer(headers: &HeaderMap, error: &str, message: &str) -> Response {
+    let issuer = issuer_from_headers(headers);
+    let metadata_url = format!("{}/.well-known/oauth-protected-resource", issuer);
+    let www = format!("Bearer FAKESECRET_k1l2m3n4o5p6q7r8s9t0\"{}\", error=\"{}\"", metadata_url, error);
+
+    let mut response = (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": error,
+            "message": message
+        })),
+    )
+        .into_response();
+
+    if let Ok(value) = HeaderValue::from_str(&www) {
+        response.headers_mut().insert(header::WWW_AUTHENTICATE, value);
+    }
+    response
+}
+
 /// Validate Authorization header
 fn validate_auth(headers: &HeaderMap, expected_key: &str) -> std::result::Result<(), Response> {
     let auth_header = headers.get("authorization")
-        .and_then(|h| h.to_str().ok())
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "error": "Missing Authorization header",
-                    "message": "Use 'Authorization: Bearer <api-key>' header"
-                }))
-            ).into_response()
-        })?;
+        .and_then(|h| h.to_str().ok());
+
+    let auth_header = match auth_header {
+        Some(h) => h,
+        None => {
+            return Err(unauthorized_bearer(
+                headers,
+                "invalid_token",
+                "Missing Authorization header. Use 'Authorization: Bearer <token>' or complete OAuth.",
+            ));
+        }
+    };
 
     if !auth_header.starts_with("Bearer ") {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": "Invalid Authorization header format",
-                "message": "Use 'Authorization: Bearer <api-key>' header"
-            }))
-        ).into_response());
+        return Err(unauthorized_bearer(
+            headers,
+            "invalid_token",
+            "Invalid Authorization header format. Use 'Authorization: Bearer <token>'.",
+        ));
     }
 
     let provided_key = &auth_header[7..]; // Skip "Bearer "
     if provided_key != expected_key {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": "Invalid API key"
-            }))
-        ).into_response());
+        return Err(unauthorized_bearer(
+            headers,
+            "invalid_token",
+            "Invalid or expired access token.",
+        ));
     }
 
     Ok(())
