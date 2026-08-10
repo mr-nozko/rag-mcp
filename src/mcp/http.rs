@@ -7,7 +7,7 @@ use crate::mcp::types::*;
 use axum::{
     extract::{Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::{IntoResponse, Response, sse::{Event, KeepAlive, Sse}, Redirect},
+    response::{IntoResponse, Response, sse::{Event, Sse}, Redirect},
     routing::{get, post},
     Json, Router, Form,
 };
@@ -155,9 +155,11 @@ impl HttpMcpServer {
         };
 
         // Core MCP routes always available (authless or authenticated).
+        // POST /sse accepts Streamable HTTP probes (Cursor) with sessionless JSON fallback.
+        // GET /mcp returns explicit 405 so misrouted clients get a clear Allow: POST hint.
         let mut router = Router::new()
-            .route("/sse", get(handle_sse))  // SSE endpoint for Claude
-            .route("/mcp", post(handle_post))  // POST endpoint for JSON-RPC requests
+            .route("/sse", get(handle_sse).post(handle_post))
+            .route("/mcp", get(handle_mcp_method_not_allowed).post(handle_post))
             .route("/.well-known/mcp-server", get(handle_discovery))  // Discovery endpoint
             .route("/.well-known/mcp.json", get(handle_discovery))  // Alternative discovery endpoint
             .route("/health", get(handle_health))
@@ -390,33 +392,41 @@ async fn handle_sse(
             )
         });
     
-    // Then create a stream that sends periodic keepalive messages at proper intervals
-    // Use tokio interval to throttle events properly (every 30 seconds)
-    let mut interval_timer = interval(Duration::from_secs(30));
+    // Cursor strictly JSON-parses SSE data; never emit comment-style ": keepalive"/": ping".
+    // Named ping events with valid JSON data keep the TCP stream alive without breaking parsers.
+    let mut interval_timer = interval(Duration::from_secs(15));
     interval_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    
-    let keepalive_stream = IntervalStream::new(interval_timer)
-        .map(move |_| {
-            std::result::Result::<Event, Infallible>::Ok(Event::default().data(": keepalive"))
-        });
-    
-    // Combine: send endpoint event first, then responses, then keepalives
+
+    let keepalive_stream = IntervalStream::new(interval_timer).map(move |_| {
+        std::result::Result::<Event, Infallible>::Ok(
+            Event::default().event("ping").data("{}"),
+        )
+    });
+
+    // Combine: endpoint first, then interleave JSON-RPC message responses with pings
     let endpoint_stream = stream::once(async move {
         std::result::Result::<Event, Infallible>::Ok(endpoint_event)
     });
-    
-    // Merge streams: endpoint first, then merge responses and keepalives
-    // Use select to interleave response events with keepalives
+
     use futures_util::stream::select;
     let merged_stream = select(response_stream, keepalive_stream);
     let combined_stream = endpoint_stream.chain(merged_stream);
 
-    // Configure keepalive to send pings every 15 seconds if no events
-    let keepalive = KeepAlive::new()
-        .interval(Duration::from_secs(15))
-        .text("ping");
+    // Do not use axum KeepAlive — it emits SSE comments (`: ping`) that Cursor rejects.
+    Sse::new(combined_stream).into_response()
+}
 
-    Sse::new(combined_stream).keep_alive(keepalive).into_response()
+/// Explicit 405 for GET /mcp so clients misrouting SSE to /mcp get a clear Allow header.
+async fn handle_mcp_method_not_allowed() -> Response {
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(header::ALLOW, "POST")],
+        Json(serde_json::json!({
+            "error": "Method Not Allowed",
+            "hint": "Use GET /sse for SSE or POST /mcp for JSON-RPC"
+        })),
+    )
+        .into_response()
 }
 
 /// Handle discovery endpoint (/.well-known/mcp-server or /.well-known/mcp.json)

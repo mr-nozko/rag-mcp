@@ -1300,3 +1300,35 @@ pub async fn handle_reason(
         is_error: None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::get_tool_definitions;
+
+    /// Every MCP tool must advertise a JSON Schema object so strict clients accept tools/list.
+    #[test]
+    fn test_all_tool_input_schemas_are_objects() {
+        for pageindex_enabled in [false, true] {
+            let tools = get_tool_definitions(pageindex_enabled);
+            assert!(!tools.is_empty(), "expected at least one tool");
+            for tool in tools {
+                let schema_type = tool
+                    .input_schema
+                    .get("type")
+                    .and_then(|v| v.as_str());
+                assert_eq!(
+                    schema_type,
+                    Some("object"),
+                    "tool {} inputSchema.type must be object",
+                    tool.name
+                );
+                let properties = tool.input_schema.get("properties");
+                assert!(
+                    properties.map(|p| p.is_object()).unwrap_or(false),
+                    "tool {} inputSchema.properties must be an object",
+                    tool.name
+                );
+            }
+        }
+    }
+}
