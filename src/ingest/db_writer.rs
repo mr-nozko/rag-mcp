@@ -4,12 +4,14 @@ use sha2::{Sha256, Digest};
 use crate::error::{Result, RagmcpError};
 use crate::db::Db;
 use crate::graph::extract_routing_relations;
+use crate::ingest::metadata::normalize_doc_path;
 use super::chunker::Chunk;
 
-/// Insert or update a document in the database
-/// 
-/// Returns the document ID (SHA256 hash of doc_path).
-/// Uses ON CONFLICT to update existing documents based on doc_path.
+/// Insert or update a document in the database.
+///
+/// Returns the document ID. Paths are normalized to forward slashes so Windows
+/// `\` and MCP `/` identities collide on the same row. If a slash-variant
+/// duplicate already exists, its `doc_id` is reused and extra variant rows are deleted.
 pub async fn insert_document(
     db: &Db,
     doc_path: &str,
@@ -21,11 +23,9 @@ pub async fn insert_document(
     file_hash: &str,
     last_modified: std::time::SystemTime,
 ) -> Result<String> {
-    // Compute doc_id as SHA256 hash of doc_path
-    let mut hasher = Sha256::new();
-    hasher.update(doc_path.as_bytes());
-    let doc_id = format!("{:x}", hasher.finalize());
-    
+    // Canonical path identity for cross-platform upserts
+    let doc_path = normalize_doc_path(doc_path);
+
     // Convert SystemTime to chrono::DateTime
     let modified_dt = last_modified
         .duration_since(std::time::UNIX_EPOCH)
@@ -36,10 +36,8 @@ pub async fn insert_document(
     )
     .single()
     .ok_or_else(|| RagmcpError::Config("Failed to convert timestamp".to_string()))?;
-    
-    // Clone values to move into closure
-    let doc_id_clone = doc_id.clone();
-    let doc_path_clone = doc_path.to_string();
+
+    let doc_path_clone = doc_path.clone();
     let doc_type_clone = doc_type.to_string();
     let namespace_clone = namespace.to_string();
     let agent_name_clone = agent_name.map(|s| s.to_string());
@@ -47,45 +45,99 @@ pub async fn insert_document(
     let tokens_clone = tokens;
     let modified_str = modified_chrono.to_rfc3339();
     let file_hash_clone = file_hash.to_string();
-    
-    db.with_connection(move |conn| {
-        // Delete old chunks if document exists (CASCADE should handle this, but be explicit)
+
+    let doc_id = db.with_connection(move |conn| {
+        // Find all rows that normalize to the same path (handles \ vs / duplicates)
+        let mut stmt = conn.prepare(
+            "SELECT doc_id, doc_path FROM documents WHERE REPLACE(doc_path, '\\', '/') = ?1",
+        )?;
+        let existing: Vec<(String, String)> = stmt
+            .query_map(params![doc_path_clone], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        drop(stmt);
+
+        // Prefer an existing doc_id so chunks/FK history stay stable across slash variants
+        let doc_id = if let Some((id, _)) = existing.first() {
+            id.clone()
+        } else {
+            let mut hasher = Sha256::new();
+            hasher.update(doc_path_clone.as_bytes());
+            format!("{:x}", hasher.finalize())
+        };
+
+        // Delete slash-variant duplicates (keep primary doc_id; CASCADE removes their chunks)
+        for (other_id, other_path) in &existing {
+            if other_id != &doc_id {
+                conn.execute(
+                    "DELETE FROM documents WHERE doc_id = ?1",
+                    params![other_id],
+                )?;
+                log::info!(
+                    "Removed duplicate doc_path variant '{}' (kept normalized '{}')",
+                    other_path,
+                    doc_path_clone
+                );
+            }
+        }
+
+        // Replace chunks for this document before upserting metadata
         conn.execute(
             "DELETE FROM chunks WHERE doc_id = ?1",
-            params![doc_id_clone],
+            params![doc_id],
         )?;
-        
-        // Insert or update document
-        conn.execute(
-            r#"
-            INSERT INTO documents (
-                doc_id, doc_path, doc_type, namespace, agent_name,
-                content_text, content_tokens, last_modified, file_hash
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            ON CONFLICT(doc_path) DO UPDATE SET
-                doc_id = excluded.doc_id,
-                doc_type = excluded.doc_type,
-                namespace = excluded.namespace,
-                agent_name = excluded.agent_name,
-                content_text = excluded.content_text,
-                content_tokens = excluded.content_tokens,
-                last_modified = excluded.last_modified,
-                file_hash = excluded.file_hash
-            "#,
-            params![
-                doc_id_clone,
-                doc_path_clone,
-                doc_type_clone,
-                namespace_clone,
-                agent_name_clone,
-                content_clone,
-                tokens_clone as i64,
-                modified_str,
-                file_hash_clone,
-            ],
-        )?;
-        
-        Ok::<(), RagmcpError>(())
+
+        if existing.iter().any(|(id, _)| id == &doc_id) {
+            // Update the surviving row; rewrite doc_path to the normalized form
+            conn.execute(
+                r#"
+                UPDATE documents SET
+                    doc_path = ?1,
+                    doc_type = ?2,
+                    namespace = ?3,
+                    agent_name = ?4,
+                    content_text = ?5,
+                    content_tokens = ?6,
+                    last_modified = ?7,
+                    file_hash = ?8
+                WHERE doc_id = ?9
+                "#,
+                params![
+                    doc_path_clone,
+                    doc_type_clone,
+                    namespace_clone,
+                    agent_name_clone,
+                    content_clone,
+                    tokens_clone as i64,
+                    modified_str,
+                    file_hash_clone,
+                    doc_id,
+                ],
+            )?;
+        } else {
+            conn.execute(
+                r#"
+                INSERT INTO documents (
+                    doc_id, doc_path, doc_type, namespace, agent_name,
+                    content_text, content_tokens, last_modified, file_hash
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+                params![
+                    doc_id,
+                    doc_path_clone,
+                    doc_type_clone,
+                    namespace_clone,
+                    agent_name_clone,
+                    content_clone,
+                    tokens_clone as i64,
+                    modified_str,
+                    file_hash_clone,
+                ],
+            )?;
+        }
+
+        Ok::<String, RagmcpError>(doc_id)
     }).await?;
 
     // Extract and store knowledge-graph relations from documents that have an entity name
@@ -113,7 +165,7 @@ pub async fn insert_document(
         }
     }
 
-    Ok(doc_id.clone())
+    Ok(doc_id)
 }
 
 /// Insert chunks in batches
@@ -320,6 +372,73 @@ mod tests {
             
             Ok::<(), RagmcpError>(())
         }).await.unwrap();
+    }
+
+    /// Windows `\` and MCP `/` must collapse to one document row with reused doc_id.
+    #[tokio::test]
+    async fn test_insert_document_normalizes_slash_variants() {
+        let (db, _temp_dir) = setup_test_db().await;
+
+        // Simulate walker-stored Windows path by inserting via raw SQL with backslashes
+        let backslash_path = r"System\foo.md";
+        let mut hasher = Sha256::new();
+        hasher.update(backslash_path.as_bytes());
+        let old_doc_id = format!("{:x}", hasher.finalize());
+
+        db.with_connection({
+            let old_doc_id = old_doc_id.clone();
+            move |conn| {
+                conn.execute(
+                    r#"
+                    INSERT INTO documents (
+                        doc_id, doc_path, doc_type, namespace, agent_name,
+                        content_text, content_tokens, last_modified, file_hash
+                    ) VALUES (?1, ?2, 'markdown', 'system', NULL, 'OLD', 10, '2020-01-01T00:00:00Z', 'hash-old')
+                    "#,
+                    params![old_doc_id, backslash_path],
+                )?;
+                Ok::<(), RagmcpError>(())
+            }
+        })
+        .await
+        .unwrap();
+
+        // MCP-style update with forward slashes must reuse old_doc_id and rewrite path
+        let new_id = insert_document(
+            &db,
+            "System/foo.md",
+            "markdown",
+            "system",
+            None,
+            "NEW CONTENT",
+            20,
+            "hash-new",
+            std::time::SystemTime::now(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(new_id, old_doc_id);
+
+        db.with_connection(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM documents WHERE REPLACE(doc_path, '\\', '/') = 'System/foo.md'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 1);
+
+            let (path, content): (String, String) = conn.query_row(
+                "SELECT doc_path, content_text FROM documents WHERE doc_id = ?1",
+                params![old_doc_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!(path, "System/foo.md");
+            assert_eq!(content, "NEW CONTENT");
+            Ok::<(), RagmcpError>(())
+        })
+        .await
+        .unwrap();
     }
 
     /// End-to-end: ingest agent doc with routing content, then traverse graph (Module 9).

@@ -9,20 +9,21 @@ pub use walker::{FileMetadata, discover_files};
 pub use incremental::{
     FileClassification, classify_files, delete_documents, find_deleted_documents, get_existing_hashes,
 };
-pub use metadata::{compute_file_hash, extract_namespace, extract_agent_name};
+pub use metadata::{compute_file_hash, extract_agent_name, extract_namespace, normalize_doc_path};
 pub use parsers::{ParserRegistry, ParsedDocument, Section};
 pub use chunker::{Chunk, chunk_document, estimate_tokens};
 pub use db_writer::{insert_document, insert_chunks};
 
 /// Convenience function to ingest a single file
 /// 
-/// Orchestrates the full pipeline: parse → chunk → insert
+/// Orchestrates the full pipeline: parse → chunk → insert.
+/// Returns `(doc_id, chunk_count, total_tokens)`.
 pub async fn ingest_file(
     db: &crate::db::Db,
     file: &FileMetadata,
     parser_registry: &ParserRegistry,
     config: &crate::Config,
-) -> crate::error::Result<(usize, usize)> {
+) -> crate::error::Result<(String, usize, usize)> {
     // Read file content
     let content = std::fs::read_to_string(&file.absolute_path)
         .map_err(crate::error::RagmcpError::Io)?;
@@ -30,14 +31,15 @@ pub async fn ingest_file(
     // Compute file hash
     let file_hash = compute_file_hash(&file.absolute_path)?;
     
-    // Extract metadata
-    let namespace = extract_namespace(&file.relative_path);
-    let agent_name = extract_agent_name(&file.relative_path);
+    // Extract metadata from normalized relative path
+    let relative_path = normalize_doc_path(&file.relative_path);
+    let namespace = extract_namespace(&relative_path);
+    let agent_name = extract_agent_name(&relative_path);
     
     // Parse document
     let parsed = parser_registry.parse(
         &content,
-        &file.relative_path,
+        &relative_path,
         &file.extension,
     )?;
     
@@ -47,10 +49,10 @@ pub async fn ingest_file(
     // Estimate total tokens
     let total_tokens = chunks.iter().map(|c| c.tokens).sum::<usize>();
     
-    // Insert document
+    // Insert document (reuses existing doc_id when slash-variant row exists)
     let doc_id = insert_document(
         db,
-        &file.relative_path,
+        &relative_path,
         &parsed.doc_type,
         &namespace,
         agent_name.as_deref(),
@@ -63,5 +65,5 @@ pub async fn ingest_file(
     // Insert chunks
     let chunk_count = insert_chunks(db, &doc_id, chunks).await?;
     
-    Ok((chunk_count, total_tokens))
+    Ok((doc_id, chunk_count, total_tokens))
 }

@@ -4,6 +4,7 @@ use tokio::task;
 use crate::error::{Result, RagmcpError};
 
 /// Database connection wrapper
+#[derive(Clone)]
 pub struct Db {
     path: std::path::PathBuf,
 }
@@ -34,7 +35,8 @@ impl Db {
              PRAGMA temp_store = MEMORY; \
              PRAGMA cache_size = -65536; \
              PRAGMA mmap_size = 268435456; \
-             PRAGMA wal_autocheckpoint = 1000;"
+             PRAGMA wal_autocheckpoint = 1000; \
+             PRAGMA busy_timeout = 5000;"
         )?;
         
         Ok(conn)
@@ -59,7 +61,8 @@ impl Db {
                  PRAGMA temp_store = MEMORY; \
                  PRAGMA cache_size = -65536; \
                  PRAGMA mmap_size = 268435456; \
-                 PRAGMA wal_autocheckpoint = 1000;"
+                 PRAGMA wal_autocheckpoint = 1000; \
+                 PRAGMA busy_timeout = 5000;"
             )?;
             
             f(&mut conn)

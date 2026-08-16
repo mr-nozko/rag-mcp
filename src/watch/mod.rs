@@ -13,12 +13,12 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::embeddings::{get_chunks_without_embedding_for_doc, store_embeddings_batch, OpenAIEmbedder};
 use crate::error::{Result, RagmcpError};
-use crate::ingest::{compute_file_hash, ingest_file, FileMetadata, ParserRegistry};
+use crate::ingest::{compute_file_hash, ingest_file, normalize_doc_path, FileMetadata, ParserRegistry};
 use sha2::{Digest, Sha256};
 
 /// Build FileMetadata from an absolute path and the qm_os root.
 /// Returns None if the path is outside root or has an unsupported extension.
-const ALLOWED_EXTENSIONS: &[&str] = &["xml", "yaml", "yml", "json", "md"];
+const ALLOWED_EXTENSIONS: &[&str] = &["xml", "yaml", "yml", "json", "md", "txt"];
 
 pub fn file_metadata_from_path(absolute_path: &Path, root: &Path) -> Result<Option<FileMetadata>> {
     let root = root
@@ -32,11 +32,12 @@ pub fn file_metadata_from_path(absolute_path: &Path, root: &Path) -> Result<Opti
         return Ok(None);
     }
 
-    let relative_path = absolute_path
-        .strip_prefix(&root)
-        .map_err(|_| RagmcpError::Config("strip_prefix".to_string()))?
-        .to_string_lossy()
-        .replace('\\', "/");
+    let relative_path = normalize_doc_path(
+        &absolute_path
+            .strip_prefix(&root)
+            .map_err(|_| RagmcpError::Config("strip_prefix".to_string()))?
+            .to_string_lossy(),
+    );
 
     let extension = absolute_path
         .extension()
@@ -63,20 +64,51 @@ pub fn file_metadata_from_path(absolute_path: &Path, root: &Path) -> Result<Opti
 }
 
 /// Check if the document at doc_path has the given hash in the database.
-async fn get_stored_hash_for_path(db: &Db, doc_path: &str) -> Result<Option<String>> {
-    let doc_path = doc_path.to_string();
+/// Uses normalized path matching so `\` and `/` variants resolve.
+/// Returns `(file_hash, doc_id)` when a row exists.
+async fn get_stored_hash_and_id_for_path(db: &Db, doc_path: &str) -> Result<Option<(String, String)>> {
+    let doc_path = normalize_doc_path(doc_path);
     let out = db
         .with_connection(move |conn| {
-            let mut stmt = conn.prepare("SELECT file_hash FROM documents WHERE doc_path = ?1")?;
+            let mut stmt = conn.prepare(
+                "SELECT file_hash, doc_id FROM documents WHERE REPLACE(doc_path, '\\', '/') = ?1 ORDER BY last_modified DESC LIMIT 1",
+            )?;
             let mut rows = stmt.query([&doc_path])?;
             if let Some(row) = rows.next()? {
                 let h: String = row.get(0)?;
-                return Ok(Some(h));
+                let id: String = row.get(1)?;
+                return Ok(Some((h, id)));
             }
             Ok(None)
         })
         .await?;
     Ok(out)
+}
+
+/// Embed all chunks for `doc_id` that still have NULL embeddings.
+/// Shared by the file watcher and MCP create/update tools (one OpenAI batch path).
+pub async fn embed_missing_for_doc(
+    db: &Db,
+    embedder: &OpenAIEmbedder,
+    doc_id: &str,
+    batch_size: usize,
+) -> Result<usize> {
+    let chunks = get_chunks_without_embedding_for_doc(db, doc_id).await?;
+    if chunks.is_empty() {
+        return Ok(0);
+    }
+    let mut stored = 0;
+    for batch in chunks.chunks(batch_size) {
+        let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
+        let embeddings = embedder.embed_batch(texts).await?;
+        let pairs: Vec<(String, Vec<f32>)> = batch
+            .iter()
+            .map(|(id, _)| id.clone())
+            .zip(embeddings)
+            .collect();
+        stored += store_embeddings_batch(db, pairs).await?;
+    }
+    Ok(stored)
 }
 
 /// Handle a single file change: hash check, ingest if changed, then embed chunks that have no embedding.
@@ -96,46 +128,42 @@ pub async fn handle_file_change(
         None => return Ok(()),
     };
 
-    // doc_id must match insert_document: SHA256 of doc_path (relative_path)
-    let doc_id = format!("{:x}", Sha256::digest(file.relative_path.as_bytes()));
+    // Prefer DB doc_id when present so slash-variant upserts embed the correct rows
     let current_hash = compute_file_hash(&file.absolute_path)?;
-    let stored_hash = get_stored_hash_for_path(db, &file.relative_path).await?;
-
-    let hash_unchanged = stored_hash.as_deref() == Some(current_hash.as_str());
+    let stored = get_stored_hash_and_id_for_path(db, &file.relative_path).await?;
+    let hash_unchanged = stored
+        .as_ref()
+        .map(|(h, _)| h.as_str() == current_hash.as_str())
+        .unwrap_or(false);
 
     if hash_unchanged {
+        let doc_id = stored
+            .as_ref()
+            .map(|(_, id)| id.clone())
+            .unwrap_or_else(|| format!("{:x}", Sha256::digest(file.relative_path.as_bytes())));
         // Skip re-ingestion; still backfill any chunks that have NULL embedding for this doc
-        let chunks = get_chunks_without_embedding_for_doc(db, &doc_id).await?;
-        if chunks.is_empty() {
+        let stored_count =
+            embed_missing_for_doc(db, embedder, &doc_id, config.embeddings.batch_size).await?;
+        if stored_count == 0 {
             log::info!("watch: {} skip (unchanged, all embedded)", file.relative_path);
             return Ok(());
-        }
-        let batch_size = config.embeddings.batch_size;
-        let mut stored = 0;
-        for batch in chunks.chunks(batch_size) {
-            let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
-            let embeddings = embedder.embed_batch(texts).await?;
-            let pairs: Vec<(String, Vec<f32>)> = batch
-                .iter()
-                .map(|(id, _)| id.clone())
-                .zip(embeddings)
-                .collect();
-            stored += store_embeddings_batch(db, pairs).await?;
         }
         log::info!(
             "watch: {} skip ingest, backfilled {} embeddings in {:?}",
             file.relative_path,
-            stored,
+            stored_count,
             start.elapsed()
         );
         return Ok(());
     }
 
-    // New or modified: re-ingest then embed only chunks without embeddings
-    ingest_file(db, &file, parser_registry, config).await?;
+    // New or modified: re-ingest then embed using the upserted doc_id
+    let (doc_id, _chunk_count, _tokens) =
+        ingest_file(db, &file, parser_registry, config).await?;
 
-    let chunks = get_chunks_without_embedding_for_doc(db, &doc_id).await?;
-    if chunks.is_empty() {
+    let stored_count =
+        embed_missing_for_doc(db, embedder, &doc_id, config.embeddings.batch_size).await?;
+    if stored_count == 0 {
         log::info!(
             "watch: {} ingested, no new chunks to embed in {:?}",
             file.relative_path,
@@ -144,23 +172,10 @@ pub async fn handle_file_change(
         return Ok(());
     }
 
-    let batch_size = config.embeddings.batch_size;
-    let mut stored = 0;
-    for batch in chunks.chunks(batch_size) {
-        let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
-        let embeddings = embedder.embed_batch(texts).await?;
-        let pairs: Vec<(String, Vec<f32>)> = batch
-            .iter()
-            .map(|(id, _)| id.clone())
-            .zip(embeddings)
-            .collect();
-        stored += store_embeddings_batch(db, pairs).await?;
-    }
-
     log::info!(
         "watch: {} ingested, {} chunks embedded in {:?}",
         file.relative_path,
-        stored,
+        stored_count,
         start.elapsed()
     );
     Ok(())
@@ -322,8 +337,9 @@ mod tests {
     #[test]
     fn test_file_metadata_from_path_unsupported_extension_returns_none() {
         let root = TempDir::new().unwrap();
-        let file_path = root.path().join("readme.txt");
-        fs::write(&file_path, "text").unwrap();
+        // .docx is not in the watcher allow-list (unlike .txt which is supported)
+        let file_path = root.path().join("readme.docx");
+        fs::write(&file_path, "binary-ish").unwrap();
 
         let meta = file_metadata_from_path(&file_path, root.path()).unwrap();
         assert!(meta.is_none());

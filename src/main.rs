@@ -143,6 +143,23 @@ async fn run_mcp_server(reasoning: bool) -> Result<()> {
         pageindex = Some(Arc::new(pi_manager));
     }
 
+    // In-process file watcher: re-ingest + embed on disk changes (PRD Module 10.3.1)
+    {
+        let watch_db = db.clone();
+        let watch_config = config.clone();
+        let watch_embedder = embedder.clone();
+        log::info!(
+            "Watching rag_folder {} (debounce 500ms)",
+            config.rag_folder().display()
+        );
+        tokio::spawn(async move {
+            if let Err(e) = ragmcp::watch::run_watcher(watch_db, watch_config, watch_embedder, 500).await
+            {
+                log::error!("File watcher exited with error: {}", e);
+            }
+        });
+    }
+
     // Create and run MCP server (stdio transport)
     let mut server = McpServer::new(db, embedder, config, chunk_cache, pageindex);
     server.run().await?;
@@ -179,6 +196,23 @@ async fn run_http_server(reasoning: bool) -> Result<()> {
         let mut pi_manager = PageIndexManager::new(8181);
         pi_manager.start(8181).await?;
         pageindex = Some(Arc::new(pi_manager));
+    }
+
+    // In-process file watcher: re-ingest + embed on disk changes (PRD Module 10.3.1)
+    {
+        let watch_db = db.clone();
+        let watch_config = config.clone();
+        let watch_embedder = embedder.clone();
+        log::info!(
+            "Watching rag_folder {} (debounce 500ms)",
+            config.rag_folder().display()
+        );
+        tokio::spawn(async move {
+            if let Err(e) = ragmcp::watch::run_watcher(watch_db, watch_config, watch_embedder, 500).await
+            {
+                log::error!("File watcher exited with error: {}", e);
+            }
+        });
     }
 
     // Create and run HTTP MCP server (custom connector / Cloudflare Tunnel transport)

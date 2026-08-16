@@ -276,7 +276,7 @@ impl McpServer {
                 .await?
             }
             "ragmcp_get" => {
-                tools::handle_get(&self.db, &params.arguments).await?
+                tools::handle_get(&self.db, &self.config, &params.arguments).await?
             }
             "ragmcp_list" => {
                 tools::handle_list(&self.db, &params.arguments).await?

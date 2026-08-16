@@ -2,6 +2,17 @@ use sha2::{Sha256, Digest};
 use std::path::Path;
 use crate::error::Result;
 
+/// Normalize a relative doc path to a stable cross-platform identity.
+///
+/// Converts backslashes to forward slashes and trims leading/trailing `/`.
+/// All ingest, write-tool, watcher, and DB lookups must use this so Windows `\`
+/// and MCP `/` paths map to the same document row.
+pub fn normalize_doc_path(path: &str) -> String {
+    path.replace('\\', "/")
+        .trim_matches('/')
+        .to_string()
+}
+
 /// Compute SHA256 hash of file contents
 pub fn compute_file_hash(path: &Path) -> Result<String> {
     let content = std::fs::read(path)
@@ -97,6 +108,14 @@ mod tests {
     use tempfile::TempDir;
     use std::fs;
     
+    #[test]
+    fn test_normalize_doc_path() {
+        assert_eq!(normalize_doc_path(r"System\foo.md"), "System/foo.md");
+        assert_eq!(normalize_doc_path("System/foo.md"), "System/foo.md");
+        assert_eq!(normalize_doc_path("/System/foo.md/"), "System/foo.md");
+        assert_eq!(normalize_doc_path(r"\System\foo.md\"), "System/foo.md");
+    }
+
     #[test]
     fn test_compute_file_hash() {
         let temp_dir = TempDir::new().unwrap();

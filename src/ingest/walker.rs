@@ -58,13 +58,15 @@ pub fn discover_files(root: &Path) -> Result<Vec<FileMetadata>> {
         let metadata = std::fs::metadata(path)
             .map_err(crate::error::RagmcpError::Io)?;
         
-        let relative_path = path
-            .strip_prefix(root)
-            .map_err(|_| crate::error::RagmcpError::Config(
-                format!("Failed to compute relative path for: {}", path.display())
-            ))?
-            .to_string_lossy()
-            .to_string();
+        // Normalize to forward-slash relative paths so DB identity matches MCP write tools
+        let relative_path = crate::ingest::metadata::normalize_doc_path(
+            &path
+                .strip_prefix(root)
+                .map_err(|_| crate::error::RagmcpError::Config(
+                    format!("Failed to compute relative path for: {}", path.display())
+                ))?
+                .to_string_lossy(),
+        );
         
         files.push(FileMetadata {
             relative_path,

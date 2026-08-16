@@ -10,9 +10,9 @@ use super::Relation;
 pub fn extract_routing_relations(agent_name: &str, content: &str) -> Vec<Relation> {
     let mut relations = Vec::new();
 
-    // Pattern matches: word → word (arrow syntax)
+    // Pattern matches: word → word (arrow syntax); allow hyphens in agent names
     let chains_regex =
-        Regex::new(r"(\w+)\s*→\s*(\w+)").expect("Invalid regex pattern");
+        Regex::new(r"([\w-]+)\s*→\s*([\w-]+)").expect("Invalid regex pattern");
 
     for cap in chains_regex.captures_iter(content) {
         let from = cap.get(1).unwrap().as_str();

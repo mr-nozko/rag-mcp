@@ -8,10 +8,11 @@ use crate::mcp::audit::log_operation;
 use crate::cache::ChunkEmbeddingCache;
 use crate::search::hybrid::search_hybrid;
 use crate::graph::traverse_graph;
-use crate::ingest::metadata::{compute_file_hash, extract_agent_name, extract_namespace};
+use crate::ingest::metadata::{compute_file_hash, extract_agent_name, extract_namespace, normalize_doc_path};
 use crate::ingest::parsers::ParserRegistry;
 use crate::ingest::chunker::chunk_document;
 use crate::ingest::db_writer::{insert_chunks, insert_document};
+use crate::watch::embed_missing_for_doc;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -398,14 +399,17 @@ struct GetParams {
 /// Handle ragmcp_get tool
 pub async fn handle_get(
     db: &Db,
+    config: &Config,
     arguments: &Value,
 ) -> Result<ToolsCallResult> {
     let params: GetParams = serde_json::from_value(arguments.clone())
         .map_err(|e| RagmcpError::Config(format!("Invalid get params: {}", e)))?;
 
     // Normalize for comparison: use forward slash so we match DB regardless of stored separator (Windows \ vs /)
-    let doc_path_param = params.doc_path.replace('\\', "/").trim_matches('/').to_string();
-    let doc = db.with_connection(move |conn| {
+    let doc_path_param = normalize_doc_path(&params.doc_path);
+    let doc = db.with_connection({
+        let doc_path_param = doc_path_param.clone();
+        move |conn| {
         let mut stmt = conn.prepare(
             r#"
             SELECT 
@@ -413,6 +417,8 @@ pub async fn handle_get(
                 content_text, content_tokens, last_modified, file_hash, metadata_json
             FROM documents
             WHERE REPLACE(doc_path, '\', '/') = ?
+            ORDER BY last_modified DESC
+            LIMIT 1
             "#
         )?;
 
@@ -435,7 +441,7 @@ pub async fn handle_get(
         })?;
 
         Ok::<_, RagmcpError>(row)
-    }).await?;
+    }}).await?;
 
     let (_doc_id, doc_path, doc_type, namespace, agent_name, content_text, content_tokens, last_modified, file_hash, _metadata_json) = doc;
 
@@ -450,8 +456,18 @@ pub async fn handle_get(
     result_text.push_str(&format!("Hash: {}\n\n", file_hash));
 
     if params.return_full_doc {
+        // Prefer live file on disk so MCP writes are visible even if index briefly lags
+        let disk_path = config.rag_folder().join(&doc_path_param);
+        let full_content = match fs::read_to_string(&disk_path) {
+            Ok(text) => text,
+            Err(_) => {
+                // Fall back to indexed content_text if the file is missing
+                result_text.push_str("(Disk file missing; showing indexed content_text)\n");
+                content_text
+            }
+        };
         result_text.push_str("Full Content:\n");
-        result_text.push_str(&content_text);
+        result_text.push_str(&full_content);
     } else {
         result_text.push_str("(Use return_full_doc=true to see full content)\n");
     }
@@ -720,8 +736,8 @@ pub async fn handle_explain(
                 RagmcpError::Config("doc_path required for doc_info".to_string())
             })?;
 
-            // Normalize path separators: convert forward slashes to backslashes to match database storage
-            let doc_path = doc_path.replace('/', "\\");
+            // Normalize path separators to match documents stored with forward slashes
+            let doc_path = normalize_doc_path(&doc_path);
             let doc_path_clone = doc_path.clone();
             let info = db.with_connection(move |conn| {
                 let mut stmt = conn.prepare(
@@ -730,7 +746,9 @@ pub async fn handle_explain(
                         doc_path, doc_type, namespace, agent_name,
                         content_tokens, last_modified, file_hash
                     FROM documents
-                    WHERE doc_path = ?
+                    WHERE REPLACE(doc_path, '\', '/') = ?
+                    ORDER BY last_modified DESC
+                    LIMIT 1
                     "#
                 )?;
 
@@ -765,7 +783,7 @@ pub async fn handle_explain(
             let doc_path_for_chunks = doc_path.clone();
             let chunk_count = db.with_connection(move |conn| {
                 let doc_id: String = conn.query_row(
-                    "SELECT doc_id FROM documents WHERE doc_path = ?",
+                    "SELECT doc_id FROM documents WHERE REPLACE(doc_path, '\\', '/') = ? ORDER BY last_modified DESC LIMIT 1",
                     params![doc_path_for_chunks],
                     |row| row.get(0)
                 )?;
@@ -837,10 +855,10 @@ struct CreateDocParams {
     doc_type: Option<String>,
 }
 
-/// Create a new document: validate path, create dirs, write file, parse, chunk, insert, audit.
+/// Create a new document: validate path, create dirs, write file, parse, chunk, insert, embed, audit.
 pub async fn handle_create_doc(
     db: &Db,
-    _embedder: &OpenAIEmbedder,
+    embedder: &OpenAIEmbedder,
     config: &Config,
     _cache: Option<Arc<ChunkEmbeddingCache>>,
     arguments: &Value,
@@ -849,14 +867,17 @@ pub async fn handle_create_doc(
     let params: CreateDocParams = serde_json::from_value(arguments.clone())
         .map_err(|e| RagmcpError::InvalidInput(format!("Invalid parameters: {}", e)))?;
 
+    // Canonical path identity before any DB write
+    let doc_path = normalize_doc_path(&params.doc_path);
+
     let validator = PathValidator::new(&config.ragmcp.rag_folder)?;
-    let absolute_path = validator.validate_write_path(&params.doc_path)?;
+    let absolute_path = validator.validate_write_path(&doc_path)?;
 
     if absolute_path.exists() {
         let _ = log_operation(
             db,
             "create",
-            &params.doc_path,
+            &doc_path,
             None,
             false,
             Some("File already exists"),
@@ -865,7 +886,7 @@ pub async fn handle_create_doc(
         .await;
         return Err(RagmcpError::InvalidInput(format!(
             "File already exists: {}",
-            params.doc_path
+            doc_path
         )));
     }
 
@@ -880,20 +901,20 @@ pub async fn handle_create_doc(
 
     // Parse and chunk in a block so ParserRegistry (non-Send) is dropped before any await.
     let (doc_type, namespace, agent_name, chunks, total_tokens, content) = {
-        let extension = Path::new(&params.doc_path)
+        let extension = Path::new(&doc_path)
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
         let registry = ParserRegistry::new();
         let parsed = registry
-            .parse(&params.content, &params.doc_path, &extension)
+            .parse(&params.content, &doc_path, &extension)
             .map_err(|e| RagmcpError::Parse(e.to_string()))?;
         let doc_type = params
             .doc_type
             .unwrap_or_else(|| parsed.doc_type.clone());
-        let namespace = extract_namespace(&params.doc_path);
-        let agent_name = extract_agent_name(&params.doc_path);
+        let namespace = extract_namespace(&doc_path);
+        let agent_name = extract_agent_name(&doc_path);
         let chunks = chunk_document(&parsed, &config.performance)?;
         let total_tokens = chunks.iter().map(|c| c.tokens).sum::<usize>();
         (doc_type, namespace, agent_name, chunks, total_tokens, parsed.content)
@@ -901,7 +922,7 @@ pub async fn handle_create_doc(
 
     let doc_id = insert_document(
         db,
-        &params.doc_path,
+        &doc_path,
         &doc_type,
         &namespace,
         agent_name.as_deref(),
@@ -914,16 +935,25 @@ pub async fn handle_create_doc(
 
     let chunk_count = insert_chunks(db, &doc_id, chunks).await?;
 
+    // Embed immediately so search/get stay fresh without a separate embed CLI
+    let embedded = embed_missing_for_doc(db, embedder, &doc_id, config.embeddings.batch_size).await?;
+    log::info!(
+        "create_doc: {} chunks created, {} embeddings stored",
+        chunk_count,
+        embedded
+    );
+
     let meta_json = json!({
         "doc_type": doc_type,
         "chunk_count": chunk_count,
+        "embeddings_stored": embedded,
         "file_hash": file_hash
     })
     .to_string();
     let operation_id = log_operation(
         db,
         "create",
-        &params.doc_path,
+        &doc_path,
         Some(&doc_id),
         true,
         None,
@@ -934,8 +964,9 @@ pub async fn handle_create_doc(
     let text = json!({
         "success": true,
         "doc_id": doc_id,
-        "doc_path": params.doc_path,
+        "doc_path": doc_path,
         "chunks_created": chunk_count,
+        "embeddings_stored": embedded,
         "operation_id": operation_id,
         "message": "Document created successfully"
     })
@@ -943,7 +974,7 @@ pub async fn handle_create_doc(
 
     if let Some(pi) = pageindex {
         let pi_clone = pi.clone();
-        let path_clone = params.doc_path.clone();
+        let path_clone = doc_path.clone();
         let doc_id_clone = doc_id.clone();
         let db_path = config.db_path().to_path_buf();
         let model_clone = config.pageindex.default_model.clone();
@@ -985,10 +1016,10 @@ struct UpdateDocParams {
     updates: Vec<DocUpdate>,
 }
 
-/// Update an existing document: validate path, create dirs if needed, write file, re-parse, re-chunk, upsert, audit.
+/// Update an existing document: validate path, create dirs if needed, write file, re-parse, re-chunk, upsert, embed, audit.
 pub async fn handle_update_doc(
     db: &Db,
-    _embedder: &OpenAIEmbedder,
+    embedder: &OpenAIEmbedder,
     config: &Config,
     _cache: Option<Arc<ChunkEmbeddingCache>>,
     arguments: &Value,
@@ -997,14 +1028,17 @@ pub async fn handle_update_doc(
     let params: UpdateDocParams = serde_json::from_value(arguments.clone())
         .map_err(|e| RagmcpError::InvalidInput(format!("Invalid parameters: {}", e)))?;
 
+    // Canonical path identity before any DB write
+    let doc_path = normalize_doc_path(&params.doc_path);
+
     let validator = PathValidator::new(&config.ragmcp.rag_folder)?;
-    let absolute_path = validator.validate_write_path(&params.doc_path)?;
+    let absolute_path = validator.validate_write_path(&doc_path)?;
 
     // Read existing content
     let mut current_content = if absolute_path.exists() {
         fs::read_to_string(&absolute_path).unwrap_or_default()
     } else {
-        return Err(RagmcpError::InvalidInput(format!("Cannot apply updates: File does not exist at {}", params.doc_path)));
+        return Err(RagmcpError::InvalidInput(format!("Cannot apply updates: File does not exist at {}", doc_path)));
     };
 
     for update in &params.updates {
@@ -1029,18 +1063,18 @@ pub async fn handle_update_doc(
     let last_modified = metadata.modified().map_err(RagmcpError::Io)?;
 
     let (doc_type, namespace, agent_name, chunks, total_tokens, content) = {
-        let extension = Path::new(&params.doc_path)
+        let extension = Path::new(&doc_path)
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
             .to_lowercase();
         let registry = ParserRegistry::new();
         let parsed = registry
-            .parse(&current_content, &params.doc_path, &extension)
+            .parse(&current_content, &doc_path, &extension)
             .map_err(|e| RagmcpError::Parse(e.to_string()))?;
         let doc_type = parsed.doc_type.clone();
-        let namespace = extract_namespace(&params.doc_path);
-        let agent_name = extract_agent_name(&params.doc_path);
+        let namespace = extract_namespace(&doc_path);
+        let agent_name = extract_agent_name(&doc_path);
         let chunks = chunk_document(&parsed, &config.performance)?;
         let total_tokens = chunks.iter().map(|c| c.tokens).sum::<usize>();
         (doc_type, namespace, agent_name, chunks, total_tokens, parsed.content)
@@ -1048,7 +1082,7 @@ pub async fn handle_update_doc(
 
     let doc_id = insert_document(
         db,
-        &params.doc_path,
+        &doc_path,
         &doc_type,
         &namespace,
         agent_name.as_deref(),
@@ -1061,16 +1095,25 @@ pub async fn handle_update_doc(
 
     let chunk_count = insert_chunks(db, &doc_id, chunks).await?;
 
+    // Embed immediately so search stays fresh without a separate embed CLI
+    let embedded = embed_missing_for_doc(db, embedder, &doc_id, config.embeddings.batch_size).await?;
+    log::info!(
+        "update_doc: {} chunks created, {} embeddings stored",
+        chunk_count,
+        embedded
+    );
+
     let meta_json = json!({
         "doc_type": doc_type,
         "chunk_count": chunk_count,
+        "embeddings_stored": embedded,
         "file_hash": file_hash
     })
     .to_string();
     let operation_id = log_operation(
         db,
         "update",
-        &params.doc_path,
+        &doc_path,
         Some(&doc_id),
         true,
         None,
@@ -1081,8 +1124,9 @@ pub async fn handle_update_doc(
     let text = json!({
         "success": true,
         "doc_id": doc_id,
-        "doc_path": params.doc_path,
+        "doc_path": doc_path,
         "chunks_created": chunk_count,
+        "embeddings_stored": embedded,
         "operation_id": operation_id,
         "message": "Document updated successfully"
     })
@@ -1090,7 +1134,7 @@ pub async fn handle_update_doc(
 
     if let Some(pi) = pageindex {
         let pi_clone = pi.clone();
-        let path_clone = params.doc_path.clone();
+        let path_clone = doc_path.clone();
         let doc_id_clone = doc_id.clone();
         let db_path = config.db_path().to_path_buf();
         let model_clone = config.pageindex.default_model.clone();

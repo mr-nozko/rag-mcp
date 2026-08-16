@@ -28,6 +28,7 @@ struct EmbeddingData {
 /// 
 /// Handles batch embedding generation with retry logic and rate limiting.
 /// Optionally supports caching for query embeddings to reduce API calls.
+#[derive(Clone)]
 pub struct OpenAIEmbedder {
     client: Client,
     api_key: String,

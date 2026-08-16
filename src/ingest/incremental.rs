@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::db::Db;
 use crate::error::{Result, RagmcpError};
-use crate::ingest::{compute_file_hash, FileMetadata};
+use crate::ingest::{compute_file_hash, normalize_doc_path, FileMetadata};
 
 /// Result of classifying discovered files against the database.
 #[derive(Debug, Default)]
@@ -22,8 +22,7 @@ pub struct FileClassification {
 
 /// Load all document paths and their stored file hashes from the database.
 ///
-/// Returns a map of `doc_path` → `file_hash` for O(1) lookup during classification.
-/// Paths are stored as in the database (no normalization).
+/// Returns a map of normalized `doc_path` → `file_hash` for O(1) lookup during classification.
 pub async fn get_existing_hashes(db: &Db) -> Result<HashMap<String, String>> {
     db.with_connection(|conn| {
         let mut stmt = conn.prepare("SELECT doc_path, file_hash FROM documents")?;
@@ -33,7 +32,8 @@ pub async fn get_existing_hashes(db: &Db) -> Result<HashMap<String, String>> {
         let mut map = HashMap::new();
         for row in rows {
             let (path, hash) = row?;
-            map.insert(path, hash);
+            // Normalize so classify_files matches walker + MCP paths
+            map.insert(normalize_doc_path(&path), hash);
         }
         Ok::<HashMap<String, String>, RagmcpError>(map)
     })
@@ -52,7 +52,8 @@ pub fn classify_files(
 
     for file in files {
         let current_hash = compute_file_hash(&file.absolute_path)?;
-        let existing = existing_hashes.get(&file.relative_path);
+        let normalized = normalize_doc_path(&file.relative_path);
+        let existing = existing_hashes.get(&normalized);
 
         match existing {
             None => classification.new_files.push(file.clone()),
@@ -72,6 +73,12 @@ pub async fn find_deleted_documents(
     db: &Db,
     existing_files: &HashSet<String>,
 ) -> Result<Vec<String>> {
+    // Normalize disk paths for comparison against DB (which may still hold slash variants)
+    let existing_normalized: HashSet<String> = existing_files
+        .iter()
+        .map(|p| normalize_doc_path(p))
+        .collect();
+
     let db_paths: Vec<String> = db
         .with_connection(|conn| {
             let mut stmt = conn.prepare("SELECT doc_path FROM documents")?;
@@ -86,7 +93,7 @@ pub async fn find_deleted_documents(
 
     let deleted: Vec<String> = db_paths
         .into_iter()
-        .filter(|p| !existing_files.contains(p))
+        .filter(|p| !existing_normalized.contains(&normalize_doc_path(p)))
         .collect();
 
     Ok(deleted)

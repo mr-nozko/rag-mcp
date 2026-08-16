@@ -272,8 +272,8 @@ mod tests {
     
     #[test]
     fn test_sanitize_fts5_query() {
-        // Test basic query (no special characters)
-        assert_eq!(sanitize_fts5_query("rust programming"), "rust OR programming");
+        // Terms are double-quoted to prevent FTS5 punctuation syntax errors
+        assert_eq!(sanitize_fts5_query("rust programming"), "\"rust\" OR \"programming\"");
         
         // Test double quote escaping
         assert_eq!(

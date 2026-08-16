@@ -8,9 +8,9 @@ use crate::error::Result;
 pub struct PlainTextParser;
 
 impl Parser for PlainTextParser {
-    fn can_parse(&self, _extension: &str) -> bool {
-        // This parser can handle any extension as a fallback
-        true
+    fn can_parse(&self, extension: &str) -> bool {
+        // Primary handler for .txt; also constructed directly as a structured-parser fallback
+        extension == "txt"
     }
     
     fn parse(&self, content: &str, path: &str) -> Result<ParsedDocument> {
@@ -37,5 +37,18 @@ impl Parser for PlainTextParser {
             sections,
             doc_type: doc_type.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_plaintext_can_parse_txt_only() {
+        let parser = PlainTextParser;
+        assert!(parser.can_parse("txt"));
+        assert!(!parser.can_parse("md"));
+        assert!(!parser.can_parse("json"));
     }
 }

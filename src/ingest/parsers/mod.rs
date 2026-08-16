@@ -23,7 +23,7 @@ pub struct Section {
 }
 
 /// Trait for document parsers
-pub trait Parser {
+pub trait Parser: Send + Sync {
     /// Check if this parser can handle the given file extension
     fn can_parse(&self, extension: &str) -> bool;
     
@@ -47,6 +47,8 @@ impl ParserRegistry {
         registry.register(Box::new(yaml::YamlParser));
         registry.register(Box::new(json::JsonParser));
         registry.register(Box::new(markdown::MarkdownParser));
+        // Register last: can_parse is txt-only so it won't shadow structured parsers
+        registry.register(Box::new(plaintext::PlainTextParser));
         
         registry
     }
@@ -113,7 +115,24 @@ mod tests {
         assert!(registry.find_parser("yml").is_some());
         assert!(registry.find_parser("json").is_some());
         assert!(registry.find_parser("md").is_some());
-        assert!(registry.find_parser("txt").is_none());
+        assert!(registry.find_parser("txt").is_some());
+        // Toml still has no dedicated parser (walker may discover it; ingest will error)
+        assert!(registry.find_parser("toml").is_none());
+    }
+
+    #[test]
+    fn test_txt_parser_round_trip() {
+        let registry = ParserRegistry::new();
+        let result = registry.parse("hello plaintext notes", "notes.txt", "txt");
+        assert!(result.is_ok());
+        let doc = result.unwrap();
+        assert_eq!(doc.doc_type, "plaintext");
+        assert_eq!(doc.sections.len(), 1);
+        assert_eq!(doc.sections[0].content, "hello plaintext notes");
+        assert_eq!(doc.content, "hello plaintext notes");
+        // Structured parsers still win for md/json
+        assert!(registry.find_parser("md").is_some());
+        assert!(registry.find_parser("json").is_some());
     }
     
     #[test]
