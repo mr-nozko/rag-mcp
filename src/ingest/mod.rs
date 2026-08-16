@@ -7,7 +7,8 @@ pub mod incremental;
 
 pub use walker::{FileMetadata, discover_files};
 pub use incremental::{
-    FileClassification, classify_files, delete_documents, find_deleted_documents, get_existing_hashes,
+    FileClassification, DeleteDocumentsResult, classify_files, delete_documents,
+    delete_documents_normalized, find_deleted_documents, get_existing_hashes,
 };
 pub use metadata::{compute_file_hash, extract_agent_name, extract_namespace, normalize_doc_path};
 pub use parsers::{ParserRegistry, ParsedDocument, Section};

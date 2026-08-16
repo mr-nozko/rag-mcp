@@ -309,6 +309,14 @@ impl McpServer {
                 )
                 .await?
             }
+            "ragmcp_delete_doc" => {
+                tools::handle_delete_doc(
+                    &self.db,
+                    &self.config,
+                    &params.arguments,
+                )
+                .await?
+            }
             "ragmcp_reason" => {
                 if let Some(pi) = &self.pageindex {
                     tools::handle_reason(

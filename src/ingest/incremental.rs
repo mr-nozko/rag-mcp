@@ -99,6 +99,17 @@ pub async fn find_deleted_documents(
     Ok(deleted)
 }
 
+/// Result of a normalized document deletion from the index.
+#[derive(Debug, Default)]
+pub struct DeleteDocumentsResult {
+    /// Number of `documents` rows removed (slash variants count separately).
+    pub deleted_count: usize,
+    /// Primary doc_id of the first matching row (if any).
+    pub doc_id: Option<String>,
+    /// agent_name from the first matching row (if any).
+    pub agent_name: Option<String>,
+}
+
 /// Delete documents by path from the database.
 ///
 /// Chunks are removed automatically via foreign key CASCADE.
@@ -120,6 +131,75 @@ pub async fn delete_documents(db: &Db, doc_paths: &[String]) -> Result<usize> {
     .await?;
 
     Ok(count)
+}
+
+/// Delete all document rows whose path normalizes to `doc_path` (`\` and `/` variants).
+///
+/// Also removes matching `pageindex_index` rows and agent-extracted `entity_relations`
+/// when an agent_name is known. Chunks are removed via CASCADE on `documents`.
+///
+/// Returns delete metadata for MCP audit responses.
+pub async fn delete_documents_normalized(
+    db: &Db,
+    doc_path: &str,
+) -> Result<DeleteDocumentsResult> {
+    let normalized = normalize_doc_path(doc_path);
+
+    db.with_connection(move |conn| {
+        // Collect matching rows first so we can clean PageIndex / relations after delete
+        let mut stmt = conn.prepare(
+            "SELECT doc_id, agent_name FROM documents WHERE REPLACE(doc_path, '\\', '/') = ?1",
+        )?;
+        let rows: Vec<(String, Option<String>)> = stmt
+            .query_map(rusqlite::params![normalized], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()?;
+        drop(stmt);
+
+        if rows.is_empty() {
+            return Ok(DeleteDocumentsResult::default());
+        }
+
+        let doc_id = rows.first().map(|(id, _)| id.clone());
+        let agent_name = rows.first().and_then(|(_, a)| a.clone());
+        let deleted_count = rows.len();
+
+        // Remove all slash-variant document rows (CASCADE clears chunks + FTS)
+        conn.execute(
+            "DELETE FROM documents WHERE REPLACE(doc_path, '\\', '/') = ?1",
+            rusqlite::params![normalized],
+        )?;
+
+        // Best-effort PageIndex cleanup (table may be absent on older DBs)
+        if let Some(ref id) = doc_id {
+            let _ = conn.execute(
+                "DELETE FROM pageindex_index WHERE doc_id = ?1 OR REPLACE(doc_path, '\\', '/') = ?2",
+                rusqlite::params![id, normalized],
+            );
+        } else {
+            let _ = conn.execute(
+                "DELETE FROM pageindex_index WHERE REPLACE(doc_path, '\\', '/') = ?1",
+                rusqlite::params![normalized],
+            );
+        }
+
+        // Remove relations previously extracted from this agent/entity
+        if let Some(ref entity) = agent_name {
+            let pattern = format!("%\"extracted_from\":\"agent:{}\"%", entity);
+            let _ = conn.execute(
+                "DELETE FROM entity_relations WHERE metadata_json LIKE ?1",
+                rusqlite::params![pattern],
+            );
+        }
+
+        Ok(DeleteDocumentsResult {
+            deleted_count,
+            doc_id,
+            agent_name,
+        })
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -294,5 +374,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(chunk_count, 0);
+    }
+
+    /// Slash-variant rows (`\` vs `/`) must all be removed by normalized delete.
+    #[tokio::test]
+    async fn test_delete_documents_normalized_slash_variants() {
+        let (db, _temp_dir) = setup_test_db().await;
+
+        // Simulate a walker-stored Windows path via raw INSERT
+        let backslash_path = r"System\old.md";
+        db.with_connection(move |conn| {
+            conn.execute(
+                r#"
+                INSERT INTO documents (
+                    doc_id, doc_path, doc_type, namespace, agent_name,
+                    content_text, content_tokens, last_modified, file_hash
+                ) VALUES ('id-old', ?1, 'markdown', 'system', NULL, 'OLD', 10, '2020-01-01T00:00:00Z', 'h')
+                "#,
+                rusqlite::params![backslash_path],
+            )?;
+            Ok::<(), crate::error::RagmcpError>(())
+        })
+        .await
+        .unwrap();
+
+        let result = delete_documents_normalized(&db, "System/old.md")
+            .await
+            .unwrap();
+        assert_eq!(result.deleted_count, 1);
+        assert_eq!(result.doc_id.as_deref(), Some("id-old"));
+
+        let remaining: i64 = db
+            .with_connection(|conn| {
+                let c: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM documents WHERE REPLACE(doc_path, '\\', '/') = 'System/old.md'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok::<i64, crate::error::RagmcpError>(c)
+            })
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn test_delete_documents_normalized_missing_returns_zero() {
+        let (db, _temp_dir) = setup_test_db().await;
+        let result = delete_documents_normalized(&db, "does/not/exist.md")
+            .await
+            .unwrap();
+        assert_eq!(result.deleted_count, 0);
+        assert!(result.doc_id.is_none());
     }
 }

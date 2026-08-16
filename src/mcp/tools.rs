@@ -12,6 +12,7 @@ use crate::ingest::metadata::{compute_file_hash, extract_agent_name, extract_nam
 use crate::ingest::parsers::ParserRegistry;
 use crate::ingest::chunker::chunk_document;
 use crate::ingest::db_writer::{insert_chunks, insert_document};
+use crate::ingest::delete_documents_normalized;
 use crate::watch::embed_missing_for_doc;
 use std::fs;
 use std::path::Path;
@@ -207,6 +208,20 @@ pub fn get_tool_definitions(pageindex_enabled: bool) -> Vec<Tool> {
                     }
                 },
                 "required": ["doc_path", "updates"]
+            }),
+        },
+        Tool {
+            name: "ragmcp_delete_doc".to_string(),
+            description: "Delete a document file under rag_folder and remove it from the search index (chunks, embeddings, PageIndex). Path must be relative to the docs root.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "doc_path": {
+                        "type": "string",
+                        "description": "Relative path of document to delete (e.g. \"Namespace/subfolder/doc.md\")"
+                    }
+                },
+                "required": ["doc_path"]
             }),
         },
     ];
@@ -1163,6 +1178,100 @@ pub async fn handle_update_doc(
     })
 }
 
+/// Params for ragmcp_delete_doc
+#[derive(Debug, Deserialize)]
+struct DeleteDocParams {
+    doc_path: String,
+}
+
+/// Delete a document file under rag_folder and remove it from the SQLite index.
+pub async fn handle_delete_doc(
+    db: &Db,
+    config: &Config,
+    arguments: &Value,
+) -> Result<ToolsCallResult> {
+    let params: DeleteDocParams = serde_json::from_value(arguments.clone())
+        .map_err(|e| RagmcpError::InvalidInput(format!("Invalid parameters: {}", e)))?;
+
+    // Canonical path identity before any FS or DB work
+    let doc_path = normalize_doc_path(&params.doc_path);
+
+    let validator = PathValidator::new(&config.ragmcp.rag_folder)?;
+    let absolute_path = validator.validate_write_path(&doc_path)?;
+
+    // Refuse directory deletes — this tool is file-only
+    if absolute_path.is_dir() {
+        return Err(RagmcpError::InvalidInput(format!(
+            "Path is a directory; ragmcp_delete_doc only deletes files: {}",
+            doc_path
+        )));
+    }
+
+    // Delete from disk when the file exists
+    let mut deleted_from_disk = false;
+    if absolute_path.is_file() {
+        fs::remove_file(&absolute_path).map_err(RagmcpError::Io)?;
+        deleted_from_disk = true;
+        log::info!("delete_doc: removed file {}", absolute_path.display());
+    }
+
+    // Remove index rows (slash-variant safe) + PageIndex + agent relations
+    let index_result = delete_documents_normalized(db, &doc_path).await?;
+    let deleted_from_index = index_result.deleted_count > 0;
+
+    if !deleted_from_disk && !deleted_from_index {
+        let _ = log_operation(
+            db,
+            "delete",
+            &doc_path,
+            None,
+            false,
+            Some("Document not found on disk or in index"),
+            None,
+        )
+        .await;
+        return Err(RagmcpError::DocumentNotFound(doc_path));
+    }
+
+    let meta_json = json!({
+        "deleted_from_disk": deleted_from_disk,
+        "deleted_from_index": deleted_from_index,
+        "index_rows_removed": index_result.deleted_count,
+        "agent_name": index_result.agent_name,
+    })
+    .to_string();
+
+    let operation_id = log_operation(
+        db,
+        "delete",
+        &doc_path,
+        index_result.doc_id.as_deref(),
+        true,
+        None,
+        Some(&meta_json),
+    )
+    .await?;
+
+    let text = json!({
+        "success": true,
+        "doc_path": doc_path,
+        "doc_id": index_result.doc_id,
+        "deleted_from_disk": deleted_from_disk,
+        "deleted_from_index": deleted_from_index,
+        "operation_id": operation_id,
+        "message": "Document deleted successfully"
+    })
+    .to_string();
+
+    Ok(ToolsCallResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text,
+        }],
+        is_error: None,
+    })
+}
+
 /// Log query to query_logs table
 async fn log_query(
     db: &Db,
@@ -1347,7 +1456,13 @@ pub async fn handle_reason(
 
 #[cfg(test)]
 mod tests {
-    use super::get_tool_definitions;
+    use super::*;
+    use crate::config::{
+        Config, EmbeddingsConfig, PerformanceConfig, RagmcpConfig, SearchConfig,
+    };
+    use crate::db::migrate;
+    use std::path::Path;
+    use tempfile::TempDir;
 
     /// Every MCP tool must advertise a JSON Schema object so strict clients accept tools/list.
     #[test]
@@ -1373,6 +1488,119 @@ mod tests {
                     tool.name
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_delete_doc_listed_in_tool_definitions() {
+        let tools = get_tool_definitions(false);
+        assert!(
+            tools.iter().any(|t| t.name == "ragmcp_delete_doc"),
+            "ragmcp_delete_doc must appear in tools/list"
+        );
+    }
+
+    fn test_config(rag_folder: &Path) -> Config {
+        Config {
+            ragmcp: RagmcpConfig {
+                rag_folder: rag_folder.to_path_buf(),
+                db_path: rag_folder.join("test.db"),
+                log_level: "info".to_string(),
+            },
+            embeddings: EmbeddingsConfig {
+                provider: "openai".to_string(),
+                model: "text-embedding-3-small".to_string(),
+                api_key_env: "OPENAI_API_KEY".to_string(),
+                batch_size: 100,
+                dimensions: 1536,
+                cache_capacity: 0,
+            },
+            search: SearchConfig {
+                default_k: 5,
+                min_score: 0.65,
+                hybrid_bm25_weight: 0.5,
+                hybrid_vector_weight: 0.5,
+            },
+            performance: PerformanceConfig {
+                max_latency_ms: 1000,
+                chunk_size_tokens: 300,
+                chunk_overlap_tokens: 50,
+            },
+            http_server: Default::default(),
+            pageindex: Default::default(),
+        }
+    }
+
+    async fn setup_delete_test() -> (Db, Config, TempDir) {
+        let temp = TempDir::new().unwrap();
+        let rag = temp.path().to_path_buf();
+        let db_path = rag.join("test.db");
+        let db = Db::new(&db_path);
+        let migrations_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        db.with_connection(move |conn| migrate::run_migrations(conn, &migrations_dir))
+            .await
+            .unwrap();
+        let config = test_config(&rag);
+        (db, config, temp)
+    }
+
+    #[tokio::test]
+    async fn test_handle_delete_doc_removes_file_and_index() {
+        let (db, config, _temp) = setup_delete_test().await;
+        let rel = "Guides/note.md";
+        let abs = config.rag_folder().join("Guides");
+        fs::create_dir_all(&abs).unwrap();
+        let file = abs.join("note.md");
+        fs::write(&file, "# hello\n").unwrap();
+
+        insert_document(
+            &db,
+            rel,
+            "markdown",
+            "guides",
+            None,
+            "# hello\n",
+            2,
+            "hash1",
+            std::time::SystemTime::now(),
+        )
+        .await
+        .unwrap();
+
+        let args = json!({ "doc_path": rel });
+        let result = handle_delete_doc(&db, &config, &args).await.unwrap();
+        assert!(result.is_error.is_none());
+        assert!(!file.exists(), "file should be deleted from disk");
+
+        let count: i64 = db
+            .with_connection(|conn| {
+                let c: i64 = conn.query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))?;
+                Ok::<i64, RagmcpError>(c)
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_delete_doc_traversal_blocked() {
+        let (db, config, _temp) = setup_delete_test().await;
+        let args = json!({ "doc_path": "../outside.md" });
+        let err = handle_delete_doc(&db, &config, &args).await.unwrap_err();
+        match err {
+            RagmcpError::InvalidInput(msg) => assert!(msg.contains("traversal") || msg.contains("..")),
+            other => panic!("expected InvalidInput, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_delete_doc_missing_errors() {
+        let (db, config, _temp) = setup_delete_test().await;
+        let args = json!({ "doc_path": "Missing/nowhere.md" });
+        let err = handle_delete_doc(&db, &config, &args).await.unwrap_err();
+        match err {
+            RagmcpError::DocumentNotFound(p) => assert_eq!(p, "Missing/nowhere.md"),
+            other => panic!("expected DocumentNotFound, got {:?}", other),
         }
     }
 }

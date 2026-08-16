@@ -2,7 +2,7 @@
 CREATE TABLE IF NOT EXISTS document_operations (
     operation_id TEXT PRIMARY KEY,
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    operation_type TEXT NOT NULL,  -- 'create' | 'update'
+    operation_type TEXT NOT NULL,  -- 'create' | 'update' | 'delete'
     doc_path TEXT NOT NULL,
     doc_id TEXT,
     user_context TEXT,            -- MCP session info (optional)
