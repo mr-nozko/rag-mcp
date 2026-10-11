@@ -6,27 +6,29 @@ This guide explains how to configure RAGMcp as a custom connector for Claude Web
 
 ## Overview of Transport Implementation
 
-1. **SSE Endpoint**: `/sse` for Server-Sent Events (required by Claude)
-2. **Discovery Endpoint**: `/.well-known/mcp-server` and `/.well-known/mcp.json`
-3. **OAuth 2.1 (recommended / default for secured access)** when `authless = false`:
-   - `/.well-known/oauth-protected-resource` (+ `/sse` path form) — RFC 9728 PRM
+1. **Streamable HTTP (primary)**: `POST /mcp` for JSON-RPC (sessionless `200 application/json` responses)
+2. **Legacy SSE**: `GET /sse` / `POST /sse` kept for compatibility (deprecated for new Claude connectors)
+3. **Discovery Endpoint**: `/.well-known/mcp-server` and `/.well-known/mcp.json` (`transport.type` = `streamable-http`, endpoint `/mcp`)
+4. **OAuth 2.1 (recommended / default for secured access)** when `authless = false`:
+   - `/.well-known/oauth-protected-resource` (+ `/mcp` and `/sse` path forms) — RFC 9728 PRM
    - `/.well-known/oauth-authorization-server` — AS metadata with `registration_endpoint`
    - `POST /register` — RFC 7591 Dynamic Client Registration (DCR)
    - `GET /authorize` — authorization code + PKCE (S256), auto-approves for fixed client
-   - `POST /token` — token exchange (public client PKCE, or confidential secret)
-   - Unauthenticated `/sse` and `/mcp` return **401** with `WWW-Authenticate: Bearer resource_metadata=…`
-4. **Status codes**: `notifications/initialized` → HTTP 202 Accepted
-5. **Transport**: Streamable HTTP + SSE
+   - `POST /token` — authorization_code + refresh_token grants (tokens = `RAGMCP_API_KEY`)
+   - Unauthenticated `/mcp` and `/sse` return **401** with `WWW-Authenticate: Bearer resource_metadata=…/oauth-protected-resource/mcp` (or `/sse`)
+   - Auth runs **before** the ready gate: unauthenticated always gets 401+PRM even while restoring from R2
+5. **Status codes**: requests → HTTP 200 JSON; `notifications/initialized` → HTTP 202; other notifications → 204
 
 ## Endpoints
 
 Replace `your-server.example.com` with your hostname.
 
-- **SSE (Claude URL)**: `https://your-server.example.com/sse`
-- **POST**: `https://your-server.example.com/mcp`
+- **Claude connector URL**: `https://your-server.example.com/mcp`
+- **Legacy SSE**: `https://your-server.example.com/sse`
 - **MCP Discovery**: `https://your-server.example.com/.well-known/mcp-server`
 - **Health**: `https://your-server.example.com/health`
-- **PRM**: `https://your-server.example.com/.well-known/oauth-protected-resource`
+- **PRM (default /mcp)**: `https://your-server.example.com/.well-known/oauth-protected-resource`
+- **PRM (/mcp path)**: `https://your-server.example.com/.well-known/oauth-protected-resource/mcp`
 - **OAuth AS**: `https://your-server.example.com/.well-known/oauth-authorization-server`
 - **DCR**: `https://your-server.example.com/register`
 - **Authorize / Token**: `/authorize`, `/token`
@@ -55,7 +57,7 @@ Replace `your-server.example.com` with your hostname.
    ```
 
 4. In Claude → **Settings → Connectors → Add custom connector**:
-   - **URL**: `https://your-server.example.com/sse`
+   - **URL**: `https://your-server.example.com/mcp`
    - **Name**: `ragmcp`
    - **Client ID / Secret**: leave empty (Claude uses DCR automatically)
    - Optional Advanced fallback: Client ID = `ragmcp-client`, Client Secret = your `RAGMCP_API_KEY`
@@ -67,7 +69,7 @@ Replace `your-server.example.com` with your hostname.
 | Error | Likely cause | Fix |
 |---|---|---|
 | *Automatic client registration isn’t supported…* | AS metadata without `registration_endpoint` | Redeploy current build (includes `/register`) or set Client ID `ragmcp-client` |
-| *Couldn't register with … sign-in service* | OAuth/DCR unreachable (authless 404, wrong URL, tunnel down) | Ensure `authless=false`, tunnel up, URL ends with `/sse`, `/register` returns 201 |
+| *Couldn't register with … sign-in service* | OAuth/DCR unreachable (authless 404, wrong URL, tunnel down) | Ensure `authless=false`, tunnel up, URL ends with `/mcp`, `/register` returns 201 |
 | *Couldn't reach the MCP server* | Origin/tunnel/WAF | Check `/health`, Cloudflare allowlist `160.79.104.0/21` if needed |
 
 ## Authless Mode (public — not recommended for production)
@@ -81,8 +83,8 @@ No OAuth routes; MCP is open. Prefer OAuth mode above for secured access.
 
 ## Important Notes
 
-1. Use **`/sse`**, not bare origin or `/mcp`, as the Claude connector URL
-2. Access token issued by `/token` is your `RAGMCP_API_KEY` (used as Bearer on `/sse` and `/mcp`)
+1. Use **`/mcp`**, not bare origin or `/sse`, as the Claude connector URL (Streamable HTTP)
+2. Access token and refresh token issued by `/token` are your `RAGMCP_API_KEY` (Bearer on `/mcp` and `/sse`)
 3. Redirect URIs allowed: `https://claude.ai/api/mcp/auth_callback` and `https://claude.com/api/mcp/auth_callback`
 4. HTTPS required (Cloudflare Tunnel)
 
@@ -100,10 +102,13 @@ Ingress should point `your-server.example.com` → `http://localhost:8081`.
 # Health
 curl https://your-server.example.com/health
 
-# Unauthenticated SSE should 401 with WWW-Authenticate
-curl -i https://your-server.example.com/sse
+# Unauthenticated POST /mcp initialize should 401 with WWW-Authenticate → …/oauth-protected-resource/mcp
+curl -i -X POST https://your-server.example.com/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
 
-# PRM + AS
+# PRM for /mcp + AS
+curl https://your-server.example.com/.well-known/oauth-protected-resource/mcp
 curl https://your-server.example.com/.well-known/oauth-protected-resource
 curl https://your-server.example.com/.well-known/oauth-authorization-server
 
@@ -123,4 +128,4 @@ curl -X POST https://your-server.example.com/mcp \
 
 - **Client ID** (DCR + manual): `ragmcp-client`
 - **Client Secret** (optional confidential mode): `RAGMCP_API_KEY`
-- **Access token**: same value as `RAGMCP_API_KEY`
+- **Access token / refresh token**: same value as `RAGMCP_API_KEY`

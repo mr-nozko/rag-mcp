@@ -14,7 +14,7 @@ Your local laptop setup (local `config.toml`, local docs folder, Cloudflare Tunn
 | Cloudflare R2 bucket | Stores your documents + `_ragmcp/ragmcp.db` backup |
 | Render Web Service | Runs `ragmcp serve-http` in Docker |
 | Custom hostname (optional) | e.g. `ragmcp.example.com` → Render |
-| Claude / Cursor | Connect to `https://YOUR-HOST/sse` after waking |
+| Claude / Cursor | Connect to `https://YOUR-HOST/mcp` after waking |
 
 ### Dashboard note (important)
 
@@ -190,8 +190,8 @@ Example: point `ragmcp.example.com` at Render.
    **Important:** leave the record **DNS only** (not proxied / orange cloud). Orange proxy can break MCP Server-Sent Events.
 
 3. Wait for TLS to become active in Render.
-4. Wake URL becomes: `https://ragmcp.example.com/wake`  
-   MCP URL: `https://ragmcp.example.com/sse`
+4.    Wake URL becomes: `https://ragmcp.example.com/wake`  
+   MCP URL: `https://ragmcp.example.com/mcp`
 
 If you already use a Cloudflare Tunnel hostname for your laptop, use a **different** hostname for Render so both can run at once.
 
@@ -201,7 +201,7 @@ If you already use a Cloudflare Tunnel hostname for your laptop, use a **differe
 
 1. Wake the server (`/wake` → HTTP 200).
 2. Claude → **Settings** → **Connectors** → **Add custom connector**.
-3. URL: `https://YOUR-HOST/sse` (must end with `/sse`).
+3. URL: `https://YOUR-HOST/mcp` (Streamable HTTP; must end with `/mcp`).
 4. Leave Client ID / Secret empty (Claude registers automatically).
 5. When the browser asks for a password, enter `RAGMCP_AUTH_PASSWORD`.
 6. After connect, tools like `ragmcp_search` should appear.
@@ -216,7 +216,7 @@ Send header:
 Authorization: Bearer YOUR_RAGMCP_API_KEY
 ```
 
-Point the MCP HTTP URL at `https://YOUR-HOST/sse` or `/mcp` as your client expects.
+Point the MCP HTTP URL at `https://YOUR-HOST/mcp` (legacy `/sse` still works).
 
 ---
 
@@ -258,7 +258,7 @@ This copies **only files that do not already exist** locally. It never overwrite
 - [ ] `/wake` returns 200
 - [ ] R2 bucket now contains `_ragmcp/ragmcp.db` after first successful boot
 - [ ] Custom domain DNS-only (if used)
-- [ ] Claude connector URL ends with `/sse`
+- [ ] Claude connector URL ends with `/mcp`
 - [ ] Dashboard still used **locally** (not on Cloudflare Pages)
 
 ---
@@ -271,8 +271,8 @@ This copies **only files that do not already exist** locally. It never overwrite
 | `/health` connection refused | Service still deploying or crashed — open Render **Logs** |
 | `/wake` stuck on 503 | Check logs for R2 auth errors; verify `R2_BUCKET`, `R2_ENDPOINT`, and Access Key |
 | Claude OAuth with no password prompt | Set `RAGMCP_AUTH_PASSWORD` on Render and redeploy |
-| 401 on `/sse` | Expected without Bearer / before OAuth completes |
-| SSE hangs / never connects via custom domain | Cloudflare proxy must be **off** (DNS only) |
+| 401 on `/mcp` (or `/sse`) | Expected without Bearer / before OAuth completes |
+| SSE hangs / never connects via custom domain | Prefer `/mcp` (Streamable HTTP); if using legacy SSE, Cloudflare proxy must be **off** (DNS only) |
 | First boot very slow | Normal while embedding; watch logs for progress |
 | Dashboard on Pages blank/errors | Not supported with current architecture — use local dashboard |
 

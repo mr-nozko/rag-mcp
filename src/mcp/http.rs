@@ -7,7 +7,7 @@ use crate::mcp::types::*;
 use crate::storage::R2Client;
 use axum::{
     extract::{Query, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{Html, IntoResponse, Response, sse::{Event, Sse}, Redirect},
     routing::{get, post},
     Json, Router, Form,
@@ -203,9 +203,8 @@ impl HttpMcpServer {
                 .allow_headers(Any)
         };
 
-        // Core MCP routes always available (authless or authenticated).
-        // POST /sse accepts Streamable HTTP probes (Cursor) with sessionless JSON fallback.
-        // GET /mcp returns explicit 405 so misrouted clients get a clear Allow: POST hint.
+        // Core MCP routes: Streamable HTTP POST /mcp is primary; GET/POST /sse kept as legacy.
+        // GET /mcp returns 405 + Allow: POST so misrouted clients get a clear hint.
         let mut router = Router::new()
             .route("/sse", get(handle_sse).post(handle_post))
             .route("/mcp", get(handle_mcp_method_not_allowed).post(handle_post))
@@ -224,8 +223,9 @@ impl HttpMcpServer {
         // Claude custom connectors discover PRM → AS metadata → DCR → authorize → token.
         if !authless {
             router = router
-                // RFC 9728 Protected Resource Metadata (root + /sse path form)
+                // RFC 9728 PRM: root + /mcp (primary) + /sse (legacy) path forms
                 .route("/.well-known/oauth-protected-resource", get(handle_protected_resource))
+                .route("/.well-known/oauth-protected-resource/mcp", get(handle_protected_resource))
                 .route("/.well-known/oauth-protected-resource/sse", get(handle_protected_resource))
                 .route("/.well-known/oauth-authorization-server", get(handle_oauth_discovery))
                 // GET shows password form when RAGMCP_AUTH_PASSWORD set; POST validates it
@@ -248,20 +248,119 @@ const CLAUDE_REDIRECT_URIS: &[&str] = &[
     "https://claude.com/api/mcp/auth_callback",
 ];
 
-/// Derive issuer base URL from the Host header (HTTPS off-localhost).
+/// Derive public issuer base URL from proxy/Host headers.
+/// Prefer X-Forwarded-Proto + X-Forwarded-Host (Render/Cloudflare) so PRM URLs match the public origin.
 fn issuer_from_headers(headers: &HeaderMap) -> String {
-    headers
-        .get("host")
+    // First value only — proxies may append a comma-separated chain.
+    let forwarded_proto = headers
+        .get("x-forwarded-proto")
         .and_then(|h| h.to_str().ok())
-        .map(|host| {
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get("host"))
+        .and_then(|h| h.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    match host {
+        Some(host) => {
             let is_local = host.starts_with("localhost") || host.starts_with("127.0.0.1");
-            if is_local {
-                format!("http://{}", host)
+            let scheme = if let Some(proto) = forwarded_proto {
+                proto
+            } else if is_local {
+                "http"
             } else {
-                format!("https://{}", host)
-            }
-        })
-        .unwrap_or_else(|| "http://localhost:8081".to_string())
+                "https"
+            };
+            format!("{}://{}", scheme, host)
+        }
+        None => "http://localhost:8081".to_string(),
+    }
+}
+
+/// MCP resource segment advertised in PRM / WWW-Authenticate (`mcp` primary, `sse` legacy).
+/// Root `/.well-known/oauth-protected-resource` defaults to `mcp` (Streamable HTTP connector URL).
+fn prm_resource_segment(request_path: &str) -> &'static str {
+    // Path-form PRM …/oauth-protected-resource/sse or MCP route /sse → legacy SSE resource.
+    if request_path.ends_with("/sse") || request_path.contains("/oauth-protected-resource/sse") {
+        "sse"
+    } else {
+        "mcp"
+    }
+}
+
+/// Pure gate order for MCP routes: unauthenticated → 401 before any ready/503 check.
+/// Handlers mirror this order; unit tests lock the contract so cold-start never masks OAuth.
+#[cfg_attr(not(test), allow(dead_code))]
+fn mcp_gate_decision(authless: bool, authenticated: bool, ready: bool) -> &'static str {
+    if !authless && !authenticated {
+        "unauthorized"
+    } else if !ready {
+        "not_ready"
+    } else {
+        "ok"
+    }
+}
+
+/// Standard OAuth token payload: access + refresh both equal RAGMCP_API_KEY (simplicity for Claude).
+fn bearer_token_json(api_key: &str) -> serde_json::Value {
+    serde_json::json!({
+        "access_token": api_key,
+        "refresh_token": api_key,
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "scope": "claudeai"
+    })
+}
+
+/// refresh_token grant: accept refresh_token == API key, re-issue the same bearer pair.
+fn refresh_token_grant(
+    refresh_token: &str,
+    api_key: &str,
+) -> std::result::Result<serde_json::Value, (&'static str, &'static str)> {
+    if refresh_token.is_empty() || refresh_token != api_key {
+        return Err((
+            "invalid_grant",
+            "Invalid refresh_token",
+        ));
+    }
+    Ok(bearer_token_json(api_key))
+}
+
+/// Discovery document for /.well-known/mcp-server and mcp.json (Streamable HTTP primary).
+fn discovery_document(authless: bool) -> serde_json::Value {
+    let mut discovery = serde_json::json!({
+        "name": "ragmcp",
+        "version": env!("CARGO_PKG_VERSION"),
+        "protocolVersion": "2024-11-05",
+        "capabilities": {
+            "tools": {}
+        },
+        "serverInfo": {
+            "name": "ragmcp",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "transport": {
+            "type": "streamable-http",
+            "endpoint": "/mcp",
+            "legacy_sse_endpoint": "/sse"
+        }
+    });
+
+    if authless {
+        discovery["authentication"] = serde_json::json!({ "type": "none" });
+    } else {
+        discovery["authentication"] = serde_json::json!({
+            "type": "oauth2",
+            "authorization_server": "/.well-known/oauth-authorization-server"
+        });
+    }
+    discovery
 }
 
 /// True if redirect_uri is an allowed Claude MCP callback.
@@ -341,15 +440,28 @@ fn still_starting_response() -> Response {
     resp
 }
 
-/// Handle POST requests (JSON-RPC requests)
-/// Per MCP spec, responses are sent via SSE message events, not POST response body.
+/// Handle POST requests (JSON-RPC) on /mcp (Streamable HTTP) and legacy /sse.
+/// Auth + Origin run before the ready gate so cold-start never hides 401+PRM from Claude.
 async fn handle_post(
     State(state): State<AppState>,
+    uri: Uri,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
     body: axum::body::Bytes,
 ) -> Response {
-    // Gate tool traffic until R2 restore completes (health/wake stay open).
+    let request_path = uri.path();
+
+    // 1) Auth first when secured — unauthenticated always 401 + PRM (even if !ready).
+    if !state.authless {
+        if let Err(response) = validate_auth(&headers, &state.api_key, request_path) {
+            return response;
+        }
+        if let Err(response) = validate_origin(&headers, &state.allowed_origins) {
+            return response;
+        }
+    }
+
+    // 2) Ready gate only after auth — authenticated (or authless) clients get 503 + Retry-After.
     if !state.is_ready() {
         return still_starting_response();
     }
@@ -364,53 +476,36 @@ async fn handle_post(
                 .into_response();
         }
     };
-    // Validate authentication (skip if authless mode)
-    if !state.authless {
-        if let Err(response) = validate_auth(&headers, &state.api_key) {
-            return response;
-        }
-    }
 
-    // Validate Origin header (skip if authless mode or no allowlist configured)
-    if !state.authless {
-        if let Err(response) = validate_origin(&headers, &state.allowed_origins) {
-            return response;
-        }
-    }
+    // HTTP requests are stateless — start uninitialized; do not enforce init across POSTs.
+    let mut initialized = false;
 
-    // Process request (HTTP transport doesn't maintain initialization state per connection)
-    // Each request is independent, so we track initialization per request session
-    // For HTTP transport, we allow all operations without requiring initialization
-    // since each request is stateless and independent
-    // We start with initialized=false so initialize can succeed, but we don't enforce it
-    let mut initialized = false; // HTTP requests are stateless - start false but don't enforce
-
-    // Get session ID from query params
     let session_id = params.get("session_id").cloned().unwrap_or_default();
-    
+    // Streamable HTTP primary: POST /mcp always returns JSON in the POST body.
+    let prefer_sessionless_json = request_path == "/mcp";
+
     let method = request.method.clone();
     let result = state.server.process_mcp_request(request, &mut initialized).await;
-    
+
     match result {
         Ok(Some(response)) => {
-            // Per MCP spec: send response via SSE message event, not POST response body
-            // Find the session's response channel and send the response
+            if prefer_sessionless_json {
+                return (StatusCode::OK, Json(response)).into_response();
+            }
+            // Legacy SSE path: push onto session channel when present.
             let sessions = state.sessions.lock().unwrap();
             if let Some(tx) = sessions.get(&session_id) {
                 let _ = tx.send(response.clone());
-            } else {
-                // Fallback: if no session, send in POST response (for backwards compatibility)
-                return (StatusCode::OK, Json(response)).into_response();
+                return StatusCode::ACCEPTED.into_response();
             }
-            // Return 202 Accepted per MCP spec - response sent via SSE
-            StatusCode::ACCEPTED.into_response()
+            // No open SSE session — sessionless JSON fallback (Cursor Streamable probes).
+            (StatusCode::OK, Json(response)).into_response()
         }
         Ok(None) => {
-            // Notification - for notifications/initialized, return 202 Accepted per MCP spec
+            // Notifications: 202 for initialized, 204 otherwise (unchanged).
             if method == "notifications/initialized" {
                 return StatusCode::ACCEPTED.into_response();
             }
-            // Other notifications return 204 No Content
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e) => {
@@ -426,27 +521,27 @@ async fn handle_post(
     }
 }
 
-/// Handle SSE (Server-Sent Events) endpoint for Claude
-/// This is the main endpoint Claude connects to for remote MCP servers.
-/// When auth is required, unauthenticated requests return 401 + WWW-Authenticate
-/// so Claude can discover OAuth Protected Resource Metadata and start the flow.
+/// Legacy SSE endpoint (deprecated compatibility). Prefer Streamable HTTP POST /mcp.
+/// Auth before ready so unauthenticated cold-start probes still receive 401 + PRM.
 async fn handle_sse(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
-    // Gate SSE until restore finishes so clients do not open half-ready sessions.
-    if !state.is_ready() {
-        return still_starting_response();
-    }
+    const SSE_PATH: &str = "/sse";
 
-    // Enforce Bearer auth in OAuth mode — 401 triggers Claude's OAuth discovery.
+    // 1) Auth + Origin first when secured.
     if !state.authless {
-        if let Err(response) = validate_auth(&headers, &state.api_key) {
+        if let Err(response) = validate_auth(&headers, &state.api_key, SSE_PATH) {
             return response;
         }
         if let Err(response) = validate_origin(&headers, &state.allowed_origins) {
             return response;
         }
+    }
+
+    // 2) Ready gate after auth — do not open half-ready SSE sessions.
+    if !state.is_ready() {
+        return still_starting_response();
     }
 
     // Per MCP spec (2024-11-05), SSE endpoint must immediately send an "endpoint" event
@@ -509,52 +604,22 @@ async fn handle_sse(
     Sse::new(combined_stream).into_response()
 }
 
-/// Explicit 405 for GET /mcp so clients misrouting SSE to /mcp get a clear Allow header.
+/// Explicit 405 for GET /mcp — Streamable HTTP uses POST /mcp (legacy SSE remains on GET /sse).
 async fn handle_mcp_method_not_allowed() -> Response {
     (
         StatusCode::METHOD_NOT_ALLOWED,
         [(header::ALLOW, "POST")],
         Json(serde_json::json!({
             "error": "Method Not Allowed",
-            "hint": "Use GET /sse for SSE or POST /mcp for JSON-RPC"
+            "hint": "Use Streamable HTTP POST /mcp for JSON-RPC (legacy GET /sse for SSE)"
         })),
     )
         .into_response()
 }
 
 /// Handle discovery endpoint (/.well-known/mcp-server or /.well-known/mcp.json)
-/// Returns server metadata for Claude to discover capabilities
 async fn handle_discovery(State(state): State<AppState>) -> Response {
-    let mut discovery = serde_json::json!({
-        "name": "ragmcp",
-        "version": env!("CARGO_PKG_VERSION"),
-        "protocolVersion": "2024-11-05",
-        "capabilities": {
-            "tools": {}
-        },
-        "serverInfo": {
-            "name": "ragmcp",
-            "version": env!("CARGO_PKG_VERSION")
-        },
-        "transport": {
-            "type": "sse",
-            "endpoint": "/sse"
-        }
-    });
-
-    // Advertise auth mode clearly so clients do not probe incomplete OAuth in authless.
-    if state.authless {
-        discovery["authentication"] = serde_json::json!({
-            "type": "none"
-        });
-    } else {
-        discovery["authentication"] = serde_json::json!({
-            "type": "oauth2",
-            "authorization_server": "/.well-known/oauth-authorization-server"
-        });
-    }
-
-    (StatusCode::OK, Json(discovery)).into_response()
+    (StatusCode::OK, Json(discovery_document(state.authless))).into_response()
 }
 
 /// Handle health check endpoint — always 200 (platform probes); includes ready flag.
@@ -589,11 +654,12 @@ async fn handle_wake(State(state): State<AppState>) -> Response {
 }
 
 /// RFC 9728 Protected Resource Metadata.
-/// Tells Claude which authorization server protects this MCP resource (/sse).
-async fn handle_protected_resource(headers: HeaderMap) -> Response {
+/// Root and `/mcp` PRM advertise `{issuer}/mcp`; `/sse` PRM keeps `{issuer}/sse`.
+async fn handle_protected_resource(uri: Uri, headers: HeaderMap) -> Response {
     let issuer = issuer_from_headers(&headers);
-    // resource must match the connector URL users paste into Claude (…/sse)
-    let resource = format!("{}/sse", issuer);
+    let segment = prm_resource_segment(uri.path());
+    // resource must match the connector URL users paste into Claude (…/mcp primary).
+    let resource = format!("{}/{}", issuer, segment);
 
     (
         StatusCode::OK,
@@ -623,7 +689,7 @@ async fn handle_oauth_discovery(
             "token_endpoint": format!("{}/token", issuer),
             // RFC 7591 — Claude uses this when no Client ID is set in Advanced settings
             "registration_endpoint": format!("{}/register", issuer),
-            "grant_types_supported": ["authorization_code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
             "response_types_supported": ["code"],
             "code_challenge_methods_supported": ["S256"],
             "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
@@ -665,7 +731,7 @@ async fn handle_register(
             "client_id_issued_at": chrono::Utc::now().timestamp(),
             "client_name": body.get("client_name").cloned().unwrap_or(serde_json::json!("Claude")),
             "redirect_uris": redirect_uris,
-            "grant_types": ["authorization_code"],
+            "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"],
             "token_endpoint_auth_method": "none",
             "code_challenge_methods": ["S256"]
@@ -903,18 +969,7 @@ async fn handle_token(
     let code_verifier = params.get("code_verifier").cloned().unwrap_or_default();
     let redirect_uri = params.get("redirect_uri").cloned().unwrap_or_default();
 
-    // Validate grant_type
-    if grant_type != "authorization_code" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "unsupported_grant_type",
-                "error_description": "Only 'authorization_code' grant type is supported"
-            }))
-        ).into_response();
-    }
-
-    // Accept fixed Client ID from DCR or Claude Advanced settings
+    // Accept fixed Client ID from DCR or Claude Advanced settings (both grants).
     if client_id != OAUTH_CLIENT_ID {
         return (
             StatusCode::BAD_REQUEST,
@@ -934,6 +989,32 @@ async fn handle_token(
             Json(serde_json::json!({
                 "error": "invalid_client",
                 "error_description": "Invalid client_secret"
+            }))
+        ).into_response();
+    }
+
+    // Claude may refresh with the same API-key refresh_token we issued.
+    if grant_type == "refresh_token" {
+        let refresh = params.get("refresh_token").cloned().unwrap_or_default();
+        return match refresh_token_grant(&refresh, &app_state.api_key) {
+            Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+            Err((error, description)) => (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": error,
+                    "error_description": description
+                })),
+            )
+                .into_response(),
+        };
+    }
+
+    if grant_type != "authorization_code" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "unsupported_grant_type",
+                "error_description": "Supported grant types: authorization_code, refresh_token"
             }))
         ).into_response();
     }
@@ -984,7 +1065,7 @@ async fn handle_token(
         let mut hasher = Sha256::new();
         hasher.update(code_verifier.as_bytes());
         let computed_challenge = URL_SAFE_NO_PAD.encode(hasher.finalize());
-        
+
         if computed_challenge != code_data.code_challenge {
             return (
                 StatusCode::BAD_REQUEST,
@@ -996,24 +1077,24 @@ async fn handle_token(
         }
     }
 
-    // Issue access token (for simplicity, we return the API key as the access token)
-    // In production, you might want to generate a separate token
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "access_token": app_state.api_key,
-            "token_type": "Bearer",
-            "expires_in": 3600,
-            "scope": "claudeai"
-        }))
-    ).into_response()
+    // Issue access + refresh tokens (both = API key) so Claude can refresh without re-auth.
+    (StatusCode::OK, Json(bearer_token_json(&app_state.api_key))).into_response()
 }
 
-/// Build a 401 that points Claude at Protected Resource Metadata (RFC 9728).
-fn unauthorized_bearer(headers: &HeaderMap, error: &str, message: &str) -> Response {
+/// Build a 401 that points Claude at the path-specific PRM (RFC 9728).
+/// `/mcp` challenges use `…/oauth-protected-resource/mcp`; `/sse` uses `…/sse`.
+fn unauthorized_bearer(
+    headers: &HeaderMap,
+    request_path: &str,
+    error: &str,
+    message: &str,
+) -> Response {
     let issuer = issuer_from_headers(headers);
-    let metadata_url = format!("{}/.well-known/oauth-protected-resource", issuer);
-    let www = format!("Bearer FAKESECRET_k1l2m3n4o5p6q7r8s9t0\"{}\", error=\"{}\"", metadata_url, error);
+    let metadata_url = unauthorized_prm_metadata_url(&issuer, request_path);
+    let www = format!(
+        "Bearer FAKESECRET_k1l2m3n4o5p6q7r8s9t0\"{}\", error=\"{}\"",
+        metadata_url, error
+    );
 
     let mut response = (
         StatusCode::UNAUTHORIZED,
@@ -1030,8 +1111,21 @@ fn unauthorized_bearer(headers: &HeaderMap, error: &str, message: &str) -> Respo
     response
 }
 
-/// Validate Authorization header
-fn validate_auth(headers: &HeaderMap, expected_key: &str) -> std::result::Result<(), Response> {
+/// WWW-Authenticate metadata URL for a challenge path (testable without building a Response).
+fn unauthorized_prm_metadata_url(issuer: &str, request_path: &str) -> String {
+    format!(
+        "{}/.well-known/oauth-protected-resource/{}",
+        issuer,
+        prm_resource_segment(request_path)
+    )
+}
+
+/// Validate Authorization header; `request_path` selects which PRM URL goes in WWW-Authenticate.
+fn validate_auth(
+    headers: &HeaderMap,
+    expected_key: &str,
+    request_path: &str,
+) -> std::result::Result<(), Response> {
     let auth_header = headers.get("authorization")
         .and_then(|h| h.to_str().ok());
 
@@ -1040,6 +1134,7 @@ fn validate_auth(headers: &HeaderMap, expected_key: &str) -> std::result::Result
         None => {
             return Err(unauthorized_bearer(
                 headers,
+                request_path,
                 "invalid_token",
                 "Missing Authorization header. Use 'Authorization: Bearer <token>' or complete OAuth.",
             ));
@@ -1049,6 +1144,7 @@ fn validate_auth(headers: &HeaderMap, expected_key: &str) -> std::result::Result
     if !auth_header.starts_with("Bearer ") {
         return Err(unauthorized_bearer(
             headers,
+            request_path,
             "invalid_token",
             "Invalid Authorization header format. Use 'Authorization: Bearer <token>'.",
         ));
@@ -1058,6 +1154,7 @@ fn validate_auth(headers: &HeaderMap, expected_key: &str) -> std::result::Result
     if provided_key != expected_key {
         return Err(unauthorized_bearer(
             headers,
+            request_path,
             "invalid_token",
             "Invalid or expired access token.",
         ));
@@ -1093,5 +1190,109 @@ fn validate_origin(headers: &HeaderMap, allowed_origins: &[String]) -> std::resu
                 "message": format!("Origin '{}' is not in the allowed origins list", origin)
             }))
         ).into_response())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn unready_without_auth_is_unauthorized_not_not_ready() {
+        // Contract: cold-start must not return 503 before OAuth 401+PRM.
+        assert_eq!(
+            mcp_gate_decision(false, false, false),
+            "unauthorized"
+        );
+        assert_eq!(mcp_gate_decision(false, true, false), "not_ready");
+        assert_eq!(mcp_gate_decision(true, false, false), "not_ready");
+        assert_eq!(mcp_gate_decision(false, true, true), "ok");
+    }
+
+    #[test]
+    fn discovery_advertises_streamable_http_mcp() {
+        let doc = discovery_document(false);
+        assert_eq!(doc["transport"]["type"], "streamable-http");
+        assert_eq!(doc["transport"]["endpoint"], "/mcp");
+        assert_eq!(doc["transport"]["legacy_sse_endpoint"], "/sse");
+        assert_eq!(doc["authentication"]["type"], "oauth2");
+    }
+
+    #[test]
+    fn unauthorized_bearer_mcp_path_references_prm_mcp() {
+        let url = unauthorized_prm_metadata_url("https://example.com", "/mcp");
+        assert_eq!(
+            url,
+            "https://example.com/.well-known/oauth-protected-resource/mcp"
+        );
+        let sse_url = unauthorized_prm_metadata_url("https://example.com", "/sse");
+        assert_eq!(
+            sse_url,
+            "https://example.com/.well-known/oauth-protected-resource/sse"
+        );
+    }
+
+    #[test]
+    fn prm_resource_selection_root_defaults_to_mcp() {
+        assert_eq!(
+            prm_resource_segment("/.well-known/oauth-protected-resource"),
+            "mcp"
+        );
+        assert_eq!(
+            prm_resource_segment("/.well-known/oauth-protected-resource/mcp"),
+            "mcp"
+        );
+        assert_eq!(
+            prm_resource_segment("/.well-known/oauth-protected-resource/sse"),
+            "sse"
+        );
+    }
+
+    #[test]
+    fn issuer_prefers_x_forwarded_proto_and_host() {
+        let headers = headers_with(&[
+            ("x-forwarded-proto", "https"),
+            ("x-forwarded-host", "ragmcp.example.com"),
+            ("host", "localhost:8081"),
+        ]);
+        assert_eq!(issuer_from_headers(&headers), "https://ragmcp.example.com");
+    }
+
+    #[test]
+    fn issuer_falls_back_to_host_when_no_forwarded() {
+        let headers = headers_with(&[("host", "localhost:8081")]);
+        assert_eq!(issuer_from_headers(&headers), "http://localhost:8081");
+    }
+
+    #[test]
+    fn refresh_token_grant_returns_api_key_pair() {
+        let api_key = "test-api-key-value";
+        let body = refresh_token_grant(api_key, api_key).expect("refresh should succeed");
+        assert_eq!(body["access_token"], api_key);
+        assert_eq!(body["refresh_token"], api_key);
+        assert_eq!(body["expires_in"], 3600);
+        assert_eq!(body["token_type"], "Bearer");
+
+        assert!(refresh_token_grant("wrong", api_key).is_err());
+    }
+
+    #[test]
+    fn authorization_code_token_json_includes_refresh_token() {
+        let body = bearer_token_json("k");
+        assert_eq!(body["refresh_token"], "k");
+        assert_eq!(body["access_token"], "k");
+        assert_eq!(body["expires_in"], 3600);
     }
 }
