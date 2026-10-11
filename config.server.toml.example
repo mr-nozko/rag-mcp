@@ -1,0 +1,47 @@
+# Example config for portable R2 server mode (Railway / Render).
+# Copy to config.toml on the host and set RAGMCP_CONFIG if needed.
+# Do NOT use this file as your laptop config.toml.
+
+[ragmcp]
+# Placeholder — overridden by storage.cache_dir when backend = "r2"
+rag_folder = "/tmp/docs"
+db_path = "/tmp/ragmcp.db"
+log_level = "info"
+
+[embeddings]
+provider = "openai"
+model = "text-embedding-3-small"
+api_key_env = "OPENAI_API_KEY"
+batch_size = 100
+dimensions = 1536
+cache_capacity = 1000
+
+[search]
+default_k = 5
+min_score = 0.65
+hybrid_bm25_weight = 0.5
+hybrid_vector_weight = 0.5
+
+[performance]
+max_latency_ms = 1000
+chunk_size_tokens = 300
+chunk_overlap_tokens = 50
+
+[http_server]
+enabled = true
+port = 8080
+api_key_env = "RAGMCP_API_KEY"
+# Public connector: OAuth + password gate (set RAGMCP_AUTH_PASSWORD)
+authless = false
+allowed_origins = []
+
+[storage]
+backend = "r2"
+cache_dir = "/tmp/docs"
+
+[storage.r2]
+bucket = "your-bucket-name"
+endpoint = "https://<accountid>.r2.cloudflarestorage.com"
+access_key_env = "R2_ACCESS_KEY_ID"
+secret_key_env = "R2_SECRET_ACCESS_KEY"
+snapshot_key = "_ragmcp/ragmcp.db"

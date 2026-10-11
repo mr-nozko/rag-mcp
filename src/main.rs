@@ -2,9 +2,11 @@ use ragmcp::Config;
 use ragmcp::cache::{ChunkEmbeddingCache, EmbeddingCache};
 use ragmcp::db::{Db, migrate};
 use ragmcp::embeddings::OpenAIEmbedder;
-use ragmcp::mcp::{HttpMcpServer, McpServer};
+use ragmcp::mcp::{HttpMcpServer, McpServer, ReadyState};
 use ragmcp::pageindex::PageIndexManager;
+use ragmcp::storage::{self, hydrate_docs, pull_missing_to_folder, R2Client};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use anyhow::Result;
 
@@ -79,6 +81,84 @@ v{}
     );
 }
 
+/// R2 write-through client only when `storage.backend = "r2"`.
+/// Credentials alone (for `pull-r2`) must not enable write-through on a laptop.
+fn maybe_r2_client(config: &Config) -> Result<Option<Arc<R2Client>>> {
+    if config.is_r2_backend() {
+        Ok(Some(Arc::new(config.r2_client_from_config()?)))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Restore snapshot + hydrate docs; bootstrap index if no snapshot; set ready; start watcher.
+async fn r2_restore_and_ready(
+    config: Config,
+    db: Db,
+    embedder: OpenAIEmbedder,
+    r2: Arc<R2Client>,
+    ready: ReadyState,
+    start_watcher: bool,
+) {
+    let cache_dir = config.rag_folder().to_path_buf();
+    let db_path = config.db_path().to_path_buf();
+
+    log::info!("R2 restore: downloading snapshot (if any)…");
+    let had_snapshot = match r2.download_snapshot(&db_path).await {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("R2 snapshot download failed: {}", e);
+            false
+        }
+    };
+
+    // Migrations after snapshot so a restored DB advances schema if needed.
+    let migrations_dir = Path::new("migrations");
+    if let Err(e) = db
+        .with_connection(|conn| migrate::run_migrations(conn, migrations_dir))
+        .await
+    {
+        log::error!("R2 restore: migrations failed: {}", e);
+    }
+
+    log::info!("R2 restore: hydrating documents into {}", cache_dir.display());
+    if let Err(e) = hydrate_docs(&r2, &cache_dir).await {
+        log::error!("R2 hydrate failed: {}", e);
+    }
+
+    if !had_snapshot {
+        log::info!("R2 restore: no snapshot — running incremental ingest + embed once");
+        if let Err(e) = storage::bootstrap_index(&db, &config, &embedder).await {
+            log::error!("R2 bootstrap ingest/embed failed: {}", e);
+        } else if let Err(e) = r2.upload_snapshot(&db_path).await {
+            log::error!("R2 initial snapshot upload failed: {}", e);
+        }
+    }
+
+    let _ = log_db_stats(&db).await;
+
+    // Mark ready BEFORE watcher so /wake and MCP open as soon as index is usable.
+    ready.store(true, Ordering::SeqCst);
+    log::info!("R2 restore complete — ready=true");
+
+    if start_watcher {
+        let watch_db = db.clone();
+        let watch_config = config.clone();
+        let watch_embedder = embedder.clone();
+        log::info!(
+            "Watching rag_folder {} (debounce 500ms) after R2 restore",
+            config.rag_folder().display()
+        );
+        tokio::spawn(async move {
+            if let Err(e) =
+                ragmcp::watch::run_watcher(watch_db, watch_config, watch_embedder, 500).await
+            {
+                log::error!("File watcher exited with error: {}", e);
+            }
+        });
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logger from environment variable or default to info level
@@ -103,6 +183,10 @@ async fn main() -> Result<()> {
             let reasoning_enabled = args.iter().any(|arg| arg == "--reasoning" || arg == "--pageindex");
             run_http_server(reasoning_enabled).await?;
         }
+        "pull-r2" => {
+            // Pull missing docs from R2 into local rag_folder (never overwrite)
+            run_pull_r2().await?;
+        }
         "index-pageindex" => {
             // Offline batch indexer for PageIndex ToCs
             run_pageindex_indexer().await?;
@@ -116,12 +200,67 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// CLI: pull missing objects from R2 into configured rag_folder (skips existing).
+async fn run_pull_r2() -> Result<()> {
+    print_startup_banner();
+    log::info!("pull-r2: loading config + R2 credentials");
+    let config = Config::load()?;
+    // Use configured rag_folder (not cache_dir override path for pull — load already
+    // overrode only when backend=r2; for laptop pull with backend!=r2, rag_folder is local docs).
+    let client = config.r2_client_from_config()?;
+    let folder = config.rag_folder().to_path_buf();
+    log::info!("pull-r2: destination {}", folder.display());
+    pull_missing_to_folder(&client, &folder).await?;
+    Ok(())
+}
+
 /// Run MCP server (stdio transport)
 async fn run_mcp_server(reasoning: bool) -> Result<()> {
     print_startup_banner();
 
     // Load configuration
     let config = Config::load()?;
+    let r2 = maybe_r2_client(&config)?;
+    let r2_mode = config.is_r2_backend();
+
+    // R2 stdio: hydrate before serving (no wake endpoint on stdio).
+    if r2_mode {
+        let client = r2
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("R2 backend requires [storage.r2] + credentials"))?
+            .clone();
+        let ready = Arc::new(AtomicBool::new(false));
+        let db = Db::new(config.db_path());
+        let embedder = build_embedder(&config)?;
+        r2_restore_and_ready(
+            config.clone(),
+            db.clone(),
+            embedder.clone(),
+            client,
+            ready.clone(),
+            true, // watcher after restore
+        )
+        .await;
+
+        let chunk_cache = Some(Arc::new(ChunkEmbeddingCache::new()));
+        let mut pageindex = None;
+        if reasoning {
+            let mut pi_manager = PageIndexManager::new(8181);
+            pi_manager.start(8181).await?;
+            pageindex = Some(Arc::new(pi_manager));
+        }
+
+        let mut server = McpServer::new_with_r2(
+            db,
+            embedder,
+            config,
+            chunk_cache,
+            pageindex,
+            r2,
+        );
+        server.run().await?;
+        return Ok(());
+    }
     
     // Initialize database and run any pending migrations
     let db = Db::new(config.db_path());
@@ -161,7 +300,7 @@ async fn run_mcp_server(reasoning: bool) -> Result<()> {
     }
 
     // Create and run MCP server (stdio transport)
-    let mut server = McpServer::new(db, embedder, config, chunk_cache, pageindex);
+    let mut server = McpServer::new_with_r2(db, embedder, config, chunk_cache, pageindex, r2);
     server.run().await?;
     
     Ok(())
@@ -175,8 +314,61 @@ async fn run_http_server(reasoning: bool) -> Result<()> {
 
     // Load configuration
     let config = Config::load()?;
+    let r2 = maybe_r2_client(&config)?;
+    let r2_mode = config.is_r2_backend();
+
+    // Ready starts false only in R2 mode so /health can answer during restore.
+    let ready: ReadyState = Arc::new(AtomicBool::new(!r2_mode));
+
+    if r2_mode {
+        let client = r2
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("R2 backend requires [storage.r2] + credentials"))?
+            .clone();
+
+        // Bind path: create server first (Db handle ok before snapshot lands on disk).
+        let db = Db::new(config.db_path());
+        let embedder = build_embedder(&config)?;
+        let chunk_cache = Some(Arc::new(ChunkEmbeddingCache::new()));
+
+        let mut pageindex = None;
+        if reasoning {
+            let mut pi_manager = PageIndexManager::new(8181);
+            pi_manager.start(8181).await?;
+            pageindex = Some(Arc::new(pi_manager));
+        }
+
+        let http_server = HttpMcpServer::new_with_ready_r2(
+            db.clone(),
+            embedder.clone(),
+            config.clone(),
+            chunk_cache,
+            pageindex,
+            ready.clone(),
+            r2.clone(),
+        )?;
+
+        // Background restore WHILE listener serves /health + /wake (bind happens in run).
+        let restore_config = config.clone();
+        let restore_ready = ready.clone();
+        tokio::spawn(async move {
+            r2_restore_and_ready(
+                restore_config,
+                db,
+                embedder,
+                client,
+                restore_ready,
+                true, // start watcher after restore
+            )
+            .await;
+        });
+
+        // Bind/listen immediately (ready may still be false).
+        http_server.run(config.http_server.port).await?;
+        return Ok(());
+    }
     
-    // Initialize database
+    // --- Local mode (unchanged behavior) ---
     let db = Db::new(config.db_path());
     
     // Run migrations
@@ -216,7 +408,15 @@ async fn run_http_server(reasoning: bool) -> Result<()> {
     }
 
     // Create and run HTTP MCP server (custom connector / Cloudflare Tunnel transport)
-    let http_server = HttpMcpServer::new(db, embedder, config.clone(), chunk_cache, pageindex)?;
+    let http_server = HttpMcpServer::new_with_ready_r2(
+        db,
+        embedder,
+        config.clone(),
+        chunk_cache,
+        pageindex,
+        ready,
+        r2,
+    )?;
     http_server.run(config.http_server.port).await?;
     
     Ok(())

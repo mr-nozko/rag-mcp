@@ -4,13 +4,15 @@ use crate::embeddings::OpenAIEmbedder;
 use crate::error::{Result, RagmcpError};
 use crate::mcp::server::McpServer;
 use crate::mcp::types::*;
+use crate::storage::R2Client;
 use axum::{
     extract::{Query, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
-    response::{IntoResponse, Response, sse::{Event, Sse}, Redirect},
+    response::{Html, IntoResponse, Response, sse::{Event, Sse}, Redirect},
     routing::{get, post},
     Json, Router, Form,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::convert::Infallible;
 use std::collections::HashMap;
@@ -25,9 +27,12 @@ use sha2::{Sha256, Digest};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use uuid::Uuid;
 
+/// Shared ready flag: false while R2 restore/hydrate runs; health always 200.
+pub type ReadyState = Arc<AtomicBool>;
+
 /// Check if a port is available by attempting to bind to it
-async fn check_port_available(port: u16) -> bool {
-    match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port)).await {
+async fn check_port_available(bind_host: &str, port: u16) -> bool {
+    match tokio::net::TcpListener::bind(format!("{}:{}", bind_host, port)).await {
         Ok(_) => true,
         Err(_) => false,
     }
@@ -39,6 +44,7 @@ pub struct HttpMcpServer {
     api_key: String,
     allowed_origins: Vec<String>,
     config: Config,
+    ready: ReadyState,
 }
 
 impl HttpMcpServer {
@@ -49,6 +55,28 @@ impl HttpMcpServer {
         config: Config,
         chunk_cache: Option<std::sync::Arc<crate::cache::ChunkEmbeddingCache>>,
         pageindex: Option<std::sync::Arc<crate::pageindex::PageIndexManager>>,
+    ) -> Result<Self> {
+        // Local/default path: ready immediately (no R2 restore).
+        Self::new_with_ready_r2(
+            db,
+            embedder,
+            config,
+            chunk_cache,
+            pageindex,
+            Arc::new(AtomicBool::new(true)),
+            None,
+        )
+    }
+
+    /// Create HTTP MCP server with explicit ready gate + optional R2 write-through.
+    pub fn new_with_ready_r2(
+        db: Db,
+        embedder: OpenAIEmbedder,
+        config: Config,
+        chunk_cache: Option<std::sync::Arc<crate::cache::ChunkEmbeddingCache>>,
+        pageindex: Option<std::sync::Arc<crate::pageindex::PageIndexManager>>,
+        ready: ReadyState,
+        r2: Option<Arc<R2Client>>,
     ) -> Result<Self> {
         // API key is optional if authless mode is enabled
         let api_key = if config.http_server.authless {
@@ -61,33 +89,53 @@ impl HttpMcpServer {
                 )))?
         };
 
-        let server = Arc::new(McpServer::new(db, embedder, config.clone(), chunk_cache, pageindex));
+        let server = Arc::new(McpServer::new_with_r2(
+            db,
+            embedder,
+            config.clone(),
+            chunk_cache,
+            pageindex,
+            r2,
+        ));
 
         Ok(Self {
             server,
             api_key,
             allowed_origins: config.http_server.allowed_origins.clone(),
             config,
+            ready,
         })
     }
 
-    /// Run the HTTP server
+    /// Run the HTTP server.
+    /// When env `PORT` is set (Railway/Render), bind `0.0.0.0:$PORT`; else `127.0.0.1` + config port.
     pub async fn run(&self, port: u16) -> Result<()> {
         let app = self.create_router();
 
-        let addr = format!("127.0.0.1:{}", port);
+        // Platform PaaS inject PORT and require all-interfaces bind for health checks.
+        let (bind_host, bind_port) = if let Ok(port_str) = std::env::var("PORT") {
+            let p: u16 = port_str.parse().map_err(|_| {
+                RagmcpError::Config(format!("Invalid PORT env value: {}", port_str))
+            })?;
+            ("0.0.0.0".to_string(), p)
+        } else {
+            ("127.0.0.1".to_string(), port)
+        };
+
+        let addr = format!("{}:{}", bind_host, bind_port);
         log::info!("Starting HTTP MCP server on http://{}", addr);
         log::info!("MCP endpoint: http://{}/mcp", addr);
+        log::info!("Ready={}", self.ready.load(Ordering::SeqCst));
 
         // Check if port is available before attempting to bind
-        if !check_port_available(port).await {
+        if !check_port_available(&bind_host, bind_port).await {
             return Err(RagmcpError::Config(format!(
                 "Port {} is already in use. Another process (possibly a previous ragmcp instance) is using this port.\n\
                 To fix this:\n\
                 1. Find the process: netstat -ano | findstr :{}\n\
                 2. Kill it: taskkill /PID <pid> /F\n\
                 3. Or use a different port by setting http_server.port in config.toml",
-                port, port
+                bind_port, bind_port
             )));
         }
 
@@ -103,7 +151,7 @@ impl HttpMcpServer {
                         1. Find the process: netstat -ano | findstr :{}\n\
                         2. Kill it: taskkill /PID <pid> /F\n\
                         3. Or use a different port by setting http_server.port in config.toml",
-                        port, port
+                        bind_port, bind_port
                     )
                 } else {
                     format!("Failed to bind to {}: {}", addr, e)
@@ -131,6 +179,7 @@ impl HttpMcpServer {
         let api_key = self.api_key.clone();
         let allowed_origins = self.allowed_origins.clone();
         let authless = self.config.http_server.authless;
+        let ready = Arc::clone(&self.ready);
 
         // Build CORS layer.
         // - If allowed_origins is configured: set it explicitly so preflight responses are consistent
@@ -163,6 +212,8 @@ impl HttpMcpServer {
             .route("/.well-known/mcp-server", get(handle_discovery))  // Discovery endpoint
             .route("/.well-known/mcp.json", get(handle_discovery))  // Alternative discovery endpoint
             .route("/health", get(handle_health))
+            // Wake probe for cold-start platforms (no auth; 503 until ready)
+            .route("/wake", get(handle_wake))
             .layer(
                 ServiceBuilder::new()
                     .layer(TraceLayer::new_for_http())
@@ -177,13 +228,14 @@ impl HttpMcpServer {
                 .route("/.well-known/oauth-protected-resource", get(handle_protected_resource))
                 .route("/.well-known/oauth-protected-resource/sse", get(handle_protected_resource))
                 .route("/.well-known/oauth-authorization-server", get(handle_oauth_discovery))
-                .route("/authorize", get(handle_authorize))
+                // GET shows password form when RAGMCP_AUTH_PASSWORD set; POST validates it
+                .route("/authorize", get(handle_authorize_get).post(handle_authorize_post))
                 .route("/token", post(handle_token))
                 // RFC 7591 Dynamic Client Registration so Claude can auto-register
                 .route("/register", post(handle_register));
         }
 
-        router.with_state(AppState::new(server_state, api_key, allowed_origins, authless))
+        router.with_state(AppState::new(server_state, api_key, allowed_origins, authless, ready))
     }
 }
 
@@ -227,6 +279,8 @@ struct AppState {
     authless: bool,
     // Session management: map session ID to response sender
     sessions: Arc<Mutex<HashMap<String, mpsc::UnboundedSender<JsonRpcResponse>>>>,
+    /// False while R2 snapshot/hydrate is in progress (MCP routes return 503).
+    ready: ReadyState,
 }
 
 /// OAuth authorization code data (PKCE flow).
@@ -246,7 +300,13 @@ struct AuthCodeData {
 }
 
 impl AppState {
-    fn new(server: Arc<McpServer>, api_key: String, allowed_origins: Vec<String>, authless: bool) -> Self {
+    fn new(
+        server: Arc<McpServer>,
+        api_key: String,
+        allowed_origins: Vec<String>,
+        authless: bool,
+        ready: ReadyState,
+    ) -> Self {
         Self {
             server,
             api_key,
@@ -254,8 +314,31 @@ impl AppState {
             auth_codes: Arc::new(Mutex::new(HashMap::new())),
             authless,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            ready,
         }
     }
+
+    fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::SeqCst)
+    }
+}
+
+/// 503 JSON used when MCP is still restoring from R2.
+fn still_starting_response() -> Response {
+    let mut resp = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "error": "still starting",
+            "message": "RAGMcp is restoring from R2. Retry shortly or poll GET /wake.",
+            "ready": false
+        })),
+    )
+        .into_response();
+    resp.headers_mut().insert(
+        header::RETRY_AFTER,
+        HeaderValue::from_static("5"),
+    );
+    resp
 }
 
 /// Handle POST requests (JSON-RPC requests)
@@ -266,6 +349,11 @@ async fn handle_post(
     Query(params): Query<HashMap<String, String>>,
     body: axum::body::Bytes,
 ) -> Response {
+    // Gate tool traffic until R2 restore completes (health/wake stay open).
+    if !state.is_ready() {
+        return still_starting_response();
+    }
+
     let request: JsonRpcRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -346,6 +434,11 @@ async fn handle_sse(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Response {
+    // Gate SSE until restore finishes so clients do not open half-ready sessions.
+    if !state.is_ready() {
+        return still_starting_response();
+    }
+
     // Enforce Bearer auth in OAuth mode — 401 triggers Claude's OAuth discovery.
     if !state.authless {
         if let Err(response) = validate_auth(&headers, &state.api_key) {
@@ -464,16 +557,35 @@ async fn handle_discovery(State(state): State<AppState>) -> Response {
     (StatusCode::OK, Json(discovery)).into_response()
 }
 
-/// Handle health check endpoint
-async fn handle_health() -> Response {
+/// Handle health check endpoint — always 200 (platform probes); includes ready flag.
+async fn handle_health(State(state): State<AppState>) -> Response {
+    let ready = state.is_ready();
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "status": "ok",
             "service": "ragmcp",
-            "version": env!("CARGO_PKG_VERSION")
+            "version": env!("CARGO_PKG_VERSION"),
+            "ready": ready
         }))
     ).into_response()
+}
+
+/// Wake endpoint for cold-start platforms: no auth; 503 + Retry-After until ready.
+async fn handle_wake(State(state): State<AppState>) -> Response {
+    if !state.is_ready() {
+        return still_starting_response();
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "awake",
+            "ready": true,
+            "service": "ragmcp",
+            "version": env!("CARGO_PKG_VERSION")
+        })),
+    )
+        .into_response()
 }
 
 /// RFC 9728 Protected Resource Metadata.
@@ -561,60 +673,74 @@ async fn handle_register(
     ).into_response()
 }
 
-/// Handle OAuth authorization endpoint (/authorize)
-/// Implements OAuth 2.0 authorization code flow with PKCE
-async fn handle_authorize(
-    State(app_state): State<AppState>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Response {
-    // Extract OAuth parameters
+/// Validate OAuth authorize query params (shared by GET/POST).
+fn validate_authorize_params(
+    params: &HashMap<String, String>,
+) -> std::result::Result<(String, String, String, String, String), Response> {
     let client_id = params.get("client_id").cloned().unwrap_or_default();
     let redirect_uri = params.get("redirect_uri").cloned().unwrap_or_default();
     let oauth_state = params.get("state").cloned().unwrap_or_default();
     let code_challenge = params.get("code_challenge").cloned().unwrap_or_default();
-    let code_challenge_method = params.get("code_challenge_method").cloned().unwrap_or("S256".to_string());
+    let code_challenge_method = params
+        .get("code_challenge_method")
+        .cloned()
+        .unwrap_or_else(|| "S256".to_string());
     let response_type = params.get("response_type").cloned().unwrap_or_default();
 
-    // Accept fixed Client ID (manual Advanced settings or DCR response)
     if client_id != OAUTH_CLIENT_ID {
-        return (
+        return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "invalid_client",
                 "error_description": "Invalid client_id"
-            }))
-        ).into_response();
+            })),
+        )
+            .into_response());
     }
-
-    // Validate response_type
     if response_type != "code" {
-        return (
+        return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "unsupported_response_type",
                 "error_description": "Only 'code' response type is supported"
-            }))
-        ).into_response();
+            })),
+        )
+            .into_response());
     }
-
-    // Allow both Claude hosted callback hosts (claude.ai and claude.com)
     if !is_allowed_claude_redirect(&redirect_uri) {
-        return (
+        return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "invalid_redirect_uri",
                 "error_description": "Invalid redirect_uri"
-            }))
-        ).into_response();
+            })),
+        )
+            .into_response());
     }
 
-    // Generate authorization code
+    Ok((
+        client_id,
+        redirect_uri,
+        oauth_state,
+        code_challenge,
+        code_challenge_method,
+    ))
+}
+
+/// Issue PKCE authorization code and redirect to Claude (current auto-approve path).
+fn issue_authorize_redirect(
+    app_state: &AppState,
+    client_id: String,
+    redirect_uri: String,
+    oauth_state: String,
+    code_challenge: String,
+    code_challenge_method: String,
+) -> Response {
     let auth_code = uuid::Uuid::new_v4().to_string();
     let expires_at = chrono::Utc::now() + chrono::Duration::minutes(10);
 
-    // Store authorization code
     let code_data = AuthCodeData {
-        client_id: client_id.clone(),
+        client_id,
         redirect_uri: redirect_uri.clone(),
         code_challenge,
         code_challenge_method,
@@ -627,13 +753,141 @@ async fn handle_authorize(
         codes.insert(auth_code.clone(), code_data);
     }
 
-    // Redirect back to Claude with authorization code
     let mut redirect_url = url::Url::parse(&redirect_uri).unwrap();
-    redirect_url.query_pairs_mut()
+    redirect_url
+        .query_pairs_mut()
         .append_pair("code", &auth_code)
         .append_pair("state", &oauth_state);
 
     Redirect::to(redirect_url.as_str()).into_response()
+}
+
+fn html_escape_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Simple password gate HTML when RAGMCP_AUTH_PASSWORD is set (public server).
+fn authorize_password_form(params: &HashMap<String, String>) -> Response {
+    let hidden: String = [
+        "client_id",
+        "redirect_uri",
+        "state",
+        "code_challenge",
+        "code_challenge_method",
+        "response_type",
+        "scope",
+    ]
+    .iter()
+    .filter_map(|k| {
+        params.get(*k).map(|v| {
+            format!(
+                r#"<input type="hidden" name="{}" value="{}" />"#,
+                k,
+                html_escape_attr(v)
+            )
+        })
+    })
+    .collect::<Vec<_>>()
+    .join("\n");
+
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>RAGMcp Authorize</title>
+<style>
+body{{font-family:system-ui,sans-serif;max-width:360px;margin:4rem auto;padding:0 1rem}}
+label{{display:block;margin-bottom:.5rem}}
+input[type=password]{{width:100%;padding:.5rem;margin-bottom:1rem}}
+button{{padding:.5rem 1rem}}
+</style></head>
+<body>
+<h1>RAGMcp</h1>
+<p>Enter the server password to authorize this connector.</p>
+<form method="POST" action="/authorize">
+{hidden}
+<label for="password">Password</label>
+<input id="password" name="password" type="password" required autofocus />
+<button type="submit">Authorize</button>
+</form>
+</body></html>"#,
+        hidden = hidden
+    );
+    (StatusCode::OK, Html(html)).into_response()
+}
+
+/// GET /authorize — password form when env set; otherwise auto-issue PKCE code (local/dev).
+async fn handle_authorize_get(
+    State(app_state): State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let (client_id, redirect_uri, oauth_state, code_challenge, code_challenge_method) =
+        match validate_authorize_params(&params) {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
+
+    // Public server: require password gate when RAGMCP_AUTH_PASSWORD is configured.
+    if std::env::var("RAGMCP_AUTH_PASSWORD").is_ok() {
+        return authorize_password_form(&params);
+    }
+
+    // Local/dev: keep auto-redirect behavior when password env is unset.
+    issue_authorize_redirect(
+        &app_state,
+        client_id,
+        redirect_uri,
+        oauth_state,
+        code_challenge,
+        code_challenge_method,
+    )
+}
+
+/// POST /authorize — verify password (when set) then issue PKCE code.
+async fn handle_authorize_post(
+    State(app_state): State<AppState>,
+    Form(params): Form<HashMap<String, String>>,
+) -> Response {
+    let (client_id, redirect_uri, oauth_state, code_challenge, code_challenge_method) =
+        match validate_authorize_params(&params) {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
+
+    if let Ok(expected) = std::env::var("RAGMCP_AUTH_PASSWORD") {
+        let provided = params.get("password").map(|s| s.as_str()).unwrap_or("");
+        // Constant-time-ish compare for equal-length strings; length mismatch fails closed.
+        let ok = provided.len() == expected.len()
+            && provided
+                .as_bytes()
+                .iter()
+                .zip(expected.as_bytes().iter())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0;
+        if !ok {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Html(
+                    r#"<!DOCTYPE html><html><body>
+<h1>Unauthorized</h1><p>Incorrect password.</p>
+<p><a href="javascript:history.back()">Try again</a></p>
+</body></html>"#
+                        .to_string(),
+                ),
+            )
+                .into_response();
+        }
+    }
+
+    issue_authorize_redirect(
+        &app_state,
+        client_id,
+        redirect_uri,
+        oauth_state,
+        code_challenge,
+        code_challenge_method,
+    )
 }
 
 /// Handle OAuth token endpoint (/token)

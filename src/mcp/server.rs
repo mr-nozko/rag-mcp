@@ -6,6 +6,7 @@ use crate::mcp::tools;
 use crate::mcp::types::*;
 use crate::cache::ChunkEmbeddingCache;
 use crate::pageindex::PageIndexManager;
+use crate::storage::R2Client;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
@@ -17,6 +18,8 @@ pub struct McpServer {
     config: Config,
     chunk_cache: Option<Arc<ChunkEmbeddingCache>>,
     pageindex: Option<Arc<PageIndexManager>>,
+    /// Optional R2 client for write-through after create/update/delete (server mode).
+    r2: Option<Arc<R2Client>>,
 }
 
 impl McpServer {
@@ -28,12 +31,25 @@ impl McpServer {
         chunk_cache: Option<Arc<ChunkEmbeddingCache>>,
         pageindex: Option<Arc<PageIndexManager>>,
     ) -> Self {
+        Self::new_with_r2(db, embedder, config, chunk_cache, pageindex, None)
+    }
+
+    /// Create MCP server with optional R2 write-through client.
+    pub fn new_with_r2(
+        db: Db,
+        embedder: OpenAIEmbedder,
+        config: Config,
+        chunk_cache: Option<Arc<ChunkEmbeddingCache>>,
+        pageindex: Option<Arc<PageIndexManager>>,
+        r2: Option<Arc<R2Client>>,
+    ) -> Self {
         Self {
             db,
             embedder,
             config,
             chunk_cache,
             pageindex,
+            r2,
         }
     }
 
@@ -295,6 +311,7 @@ impl McpServer {
                     self.chunk_cache.clone(),
                     &params.arguments,
                     self.pageindex.clone(),
+                    self.r2.clone(),
                 )
                 .await?
             }
@@ -306,6 +323,7 @@ impl McpServer {
                     self.chunk_cache.clone(),
                     &params.arguments,
                     self.pageindex.clone(),
+                    self.r2.clone(),
                 )
                 .await?
             }
@@ -314,6 +332,7 @@ impl McpServer {
                     &self.db,
                     &self.config,
                     &params.arguments,
+                    self.r2.clone(),
                 )
                 .await?
             }

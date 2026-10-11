@@ -54,6 +54,15 @@ openssl rand -base64 32
 - **MCP Integration**: Native integration with Claude Desktop via stdio transport
 - **HTTP Endpoint**: Expose MCP server via HTTP for custom connectors (Claude/ChatGPT)
 - **Public Access**: Optional Cloudflare Tunnel integration for secure public endpoint
+- **Portable R2 mode**: Optional Cloudflare R2 backend for Railway/Render free instances (see [DEPLOY_R2.md](DEPLOY_R2.md))
+
+---
+
+## Portable R2 server (optional)
+
+For deploying without a persistent disk, set `[storage] backend = "r2"` (see `config.server.toml.example`). The process hydrates docs into `cache_dir`, restores/uploads a SQLite snapshot under `_ragmcp/`, exposes `GET /wake` during cold start, and optionally gates OAuth with `RAGMCP_AUTH_PASSWORD`. Local mode (no `[storage]` / `backend != "r2"`) is unchanged.
+
+Full steps: **[DEPLOY_R2.md](DEPLOY_R2.md)**. CLI: `ragmcp pull-r2` copies missing objects into `rag_folder` only.
 
 ---
 

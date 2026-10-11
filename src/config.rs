@@ -13,6 +13,46 @@ pub struct Config {
     pub http_server: HttpServerConfig,
     #[serde(default)]
     pub pageindex: PageIndexConfig,
+    /// Optional remote storage (R2). Absent / backend!=r2 → local mode unchanged.
+    #[serde(default)]
+    pub storage: Option<StorageConfig>,
+}
+
+/// Optional `[storage]` section for portable R2 server mode.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StorageConfig {
+    /// `"r2"` enables R2 hydrate/write-through; `"local"` or absent → local disk only.
+    #[serde(default)]
+    pub backend: String,
+    /// Local cache directory used as effective rag_folder when backend=r2.
+    #[serde(default)]
+    pub cache_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub r2: Option<R2StorageConfig>,
+}
+
+/// Cloudflare R2 / S3-compatible credentials + snapshot key.
+/// Credentials may be present even when backend!=r2 (for `pull-r2` CLI).
+#[derive(Debug, Clone, Deserialize)]
+pub struct R2StorageConfig {
+    pub bucket: String,
+    pub endpoint: String,
+    #[serde(default = "default_r2_access_key_env")]
+    pub access_key_env: String,
+    #[serde(default = "default_r2_secret_key_env")]
+    pub secret_key_env: String,
+    #[serde(default = "default_r2_snapshot_key")]
+    pub snapshot_key: String,
+}
+
+fn default_r2_access_key_env() -> String {
+    "R2_ACCESS_KEY_ID".to_string()
+}
+fn default_r2_secret_key_env() -> String {
+    "R2_SECRET_ACCESS_KEY".to_string()
+}
+fn default_r2_snapshot_key() -> String {
+    crate::storage::DEFAULT_SNAPSHOT_KEY.to_string()
 }
 
 /// RAGMcp-specific configuration
@@ -169,30 +209,111 @@ impl Config {
         let config_str = std::fs::read_to_string(&config_path)
             .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
         
-        let config: Config = toml::from_str(&config_str)
+        let mut config: Config = toml::from_str(&config_str)
             .context("Failed to parse config.toml")?;
         
         // Validate configuration
         config.validate()?;
+        // When backend=r2, effective docs root becomes cache_dir for all callers.
+        config.apply_storage_overrides();
         
         Ok(config)
+    }
+
+    /// True when `[storage] backend = "r2"` (case-insensitive).
+    pub fn is_r2_backend(&self) -> bool {
+        self.storage
+            .as_ref()
+            .map(|s| s.backend.eq_ignore_ascii_case("r2"))
+            .unwrap_or(false)
+    }
+
+    /// Override rag_folder → cache_dir when running in R2 server mode.
+    pub fn apply_storage_overrides(&mut self) {
+        if !self.is_r2_backend() {
+            return;
+        }
+        if let Some(cache) = self
+            .storage
+            .as_ref()
+            .and_then(|s| s.cache_dir.clone())
+        {
+            log::info!(
+                "R2 mode: effective rag_folder → cache_dir {}",
+                cache.display()
+            );
+            self.ragmcp.rag_folder = cache;
+        }
+    }
+
+    /// Build an R2 client when `[storage.r2]` + env credentials are available.
+    /// Works even if backend!=r2 (for `pull-r2`).
+    pub fn r2_client_from_config(&self) -> Result<crate::storage::R2Client> {
+        let r2 = self
+            .storage
+            .as_ref()
+            .and_then(|s| s.r2.as_ref())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Missing [storage.r2] in config. Required for R2 mode / pull-r2."
+                )
+            })?;
+        let access_key = std::env::var(&r2.access_key_env).with_context(|| {
+            format!(
+                "Environment variable {} not set (R2 access key)",
+                r2.access_key_env
+            )
+        })?;
+        let secret_key = std::env::var(&r2.secret_key_env).with_context(|| {
+            format!(
+                "Environment variable {} not set (R2 secret key)",
+                r2.secret_key_env
+            )
+        })?;
+        crate::storage::R2Client::new(
+            r2.bucket.clone(),
+            r2.endpoint.clone(),
+            access_key,
+            secret_key,
+            r2.snapshot_key.clone(),
+        )
+        .map_err(|e| anyhow::anyhow!("{}", e))
     }
     
     /// Validate configuration values
     fn validate(&self) -> Result<()> {
-        // Validate that rag_folder exists and is a directory
-        if !self.ragmcp.rag_folder.exists() {
-            anyhow::bail!(
-                "rag_folder path does not exist: {}. Set rag_folder in config.toml to your docs directory.",
-                self.ragmcp.rag_folder.display()
-            );
-        }
-        
-        if !self.ragmcp.rag_folder.is_dir() {
-            anyhow::bail!(
-                "rag_folder must be a directory, not a file: {}",
-                self.ragmcp.rag_folder.display()
-            );
+        if self.is_r2_backend() {
+            // R2 mode: cache_dir may not exist yet (created during hydrate).
+            let cache = self
+                .storage
+                .as_ref()
+                .and_then(|s| s.cache_dir.as_ref())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("storage.backend=r2 requires storage.cache_dir")
+                })?;
+            if let Some(s) = &self.storage {
+                if s.r2.is_none() {
+                    anyhow::bail!("storage.backend=r2 requires [storage.r2] credentials section");
+                }
+            }
+            // Safety: refuse non-empty cache without marker (does not require dir to exist).
+            crate::storage::assert_cache_dir_safe(cache)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+        } else {
+            // Local mode: rag_folder must already exist (unchanged behavior).
+            if !self.ragmcp.rag_folder.exists() {
+                anyhow::bail!(
+                    "rag_folder path does not exist: {}. Set rag_folder in config.toml to your docs directory.",
+                    self.ragmcp.rag_folder.display()
+                );
+            }
+
+            if !self.ragmcp.rag_folder.is_dir() {
+                anyhow::bail!(
+                    "rag_folder must be a directory, not a file: {}",
+                    self.ragmcp.rag_folder.display()
+                );
+            }
         }
         
         // Validate environment variables
@@ -232,7 +353,7 @@ impl Config {
         &self.ragmcp.db_path
     }
     
-    /// Get the docs root path (rag_folder from config.toml)
+    /// Get the docs root path (rag_folder; equals cache_dir after R2 override)
     pub fn rag_folder(&self) -> &Path {
         &self.ragmcp.rag_folder
     }

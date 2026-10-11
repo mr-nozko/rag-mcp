@@ -20,7 +20,7 @@ This guide explains how to configure RAGMcp as a custom connector for Claude Web
 
 ## Endpoints
 
-Replace `your-server.example.com` with your hostname (e.g. `ragmcp.nlightened.club`).
+Replace `your-server.example.com` with your hostname.
 
 - **SSE (Claude URL)**: `https://your-server.example.com/sse`
 - **POST**: `https://your-server.example.com/mcp`
@@ -92,7 +92,7 @@ No OAuth routes; MCP is open. Prefer OAuth mode above for secured access.
 cloudflared tunnel --config cloudflared-config.yaml run
 ```
 
-Ingress should point `ragmcp.nlightened.club` → `http://localhost:8081`.
+Ingress should point `your-server.example.com` → `http://localhost:8081`.
 
 ## Testing
 

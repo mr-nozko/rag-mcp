@@ -14,6 +14,7 @@ use crate::ingest::chunker::chunk_document;
 use crate::ingest::db_writer::{insert_chunks, insert_document};
 use crate::ingest::delete_documents_normalized;
 use crate::watch::embed_missing_for_doc;
+use crate::storage::R2Client;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -21,6 +22,52 @@ use rusqlite::params;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
+
+/// After a successful local write, mirror the object to R2 and upload a SQLite snapshot.
+/// Search/get/watcher never call this — only create/update/delete write-through.
+async fn r2_write_through_put(
+    r2: &Option<Arc<R2Client>>,
+    db_path: &Path,
+    relative_path: &str,
+    absolute_path: &Path,
+) {
+    let Some(client) = r2 else { return };
+    match fs::read(absolute_path) {
+        Ok(bytes) => {
+            if let Err(e) = client.put_document(relative_path, &bytes).await {
+                log::error!("R2 write-through put failed for {}: {}", relative_path, e);
+                return;
+            }
+        }
+        Err(e) => {
+            log::error!(
+                "R2 write-through: cannot read {} for upload: {}",
+                absolute_path.display(),
+                e
+            );
+            return;
+        }
+    }
+    if let Err(e) = client.upload_snapshot(db_path).await {
+        log::error!("R2 snapshot upload after put failed: {}", e);
+    }
+}
+
+/// After a successful local delete, remove the R2 object and upload a SQLite snapshot.
+async fn r2_write_through_delete(
+    r2: &Option<Arc<R2Client>>,
+    db_path: &Path,
+    relative_path: &str,
+) {
+    let Some(client) = r2 else { return };
+    if let Err(e) = client.delete_document(relative_path).await {
+        log::error!("R2 write-through delete failed for {}: {}", relative_path, e);
+        return;
+    }
+    if let Err(e) = client.upload_snapshot(db_path).await {
+        log::error!("R2 snapshot upload after delete failed: {}", e);
+    }
+}
 
 /// Get all tool definitions for tools/list
 pub fn get_tool_definitions(pageindex_enabled: bool) -> Vec<Tool> {
@@ -878,6 +925,7 @@ pub async fn handle_create_doc(
     _cache: Option<Arc<ChunkEmbeddingCache>>,
     arguments: &Value,
     pageindex: Option<Arc<crate::pageindex::PageIndexManager>>,
+    r2: Option<Arc<R2Client>>,
 ) -> Result<ToolsCallResult> {
     let params: CreateDocParams = serde_json::from_value(arguments.clone())
         .map_err(|e| RagmcpError::InvalidInput(format!("Invalid parameters: {}", e)))?;
@@ -1009,6 +1057,9 @@ pub async fn handle_create_doc(
         });
     }
 
+    // R2 write-through: object + snapshot (no-op when r2 is None / local mode)
+    r2_write_through_put(&r2, config.db_path(), &doc_path, &absolute_path).await;
+
     Ok(ToolsCallResult {
         content: vec![ContentItem {
             content_type: "text".to_string(),
@@ -1039,6 +1090,7 @@ pub async fn handle_update_doc(
     _cache: Option<Arc<ChunkEmbeddingCache>>,
     arguments: &Value,
     pageindex: Option<Arc<crate::pageindex::PageIndexManager>>,
+    r2: Option<Arc<R2Client>>,
 ) -> Result<ToolsCallResult> {
     let params: UpdateDocParams = serde_json::from_value(arguments.clone())
         .map_err(|e| RagmcpError::InvalidInput(format!("Invalid parameters: {}", e)))?;
@@ -1169,6 +1221,9 @@ pub async fn handle_update_doc(
         });
     }
 
+    // R2 write-through: object + snapshot (no-op when r2 is None / local mode)
+    r2_write_through_put(&r2, config.db_path(), &doc_path, &absolute_path).await;
+
     Ok(ToolsCallResult {
         content: vec![ContentItem {
             content_type: "text".to_string(),
@@ -1189,6 +1244,7 @@ pub async fn handle_delete_doc(
     db: &Db,
     config: &Config,
     arguments: &Value,
+    r2: Option<Arc<R2Client>>,
 ) -> Result<ToolsCallResult> {
     let params: DeleteDocParams = serde_json::from_value(arguments.clone())
         .map_err(|e| RagmcpError::InvalidInput(format!("Invalid parameters: {}", e)))?;
@@ -1262,6 +1318,9 @@ pub async fn handle_delete_doc(
         "message": "Document deleted successfully"
     })
     .to_string();
+
+    // R2 write-through: delete object + snapshot (no-op when r2 is None / local mode)
+    r2_write_through_delete(&r2, config.db_path(), &doc_path).await;
 
     Ok(ToolsCallResult {
         content: vec![ContentItem {
@@ -1528,6 +1587,7 @@ mod tests {
             },
             http_server: Default::default(),
             pageindex: Default::default(),
+            storage: None,
         }
     }
 
@@ -1568,7 +1628,7 @@ mod tests {
         .unwrap();
 
         let args = json!({ "doc_path": rel });
-        let result = handle_delete_doc(&db, &config, &args).await.unwrap();
+        let result = handle_delete_doc(&db, &config, &args, None).await.unwrap();
         assert!(result.is_error.is_none());
         assert!(!file.exists(), "file should be deleted from disk");
 
@@ -1586,7 +1646,7 @@ mod tests {
     async fn test_handle_delete_doc_traversal_blocked() {
         let (db, config, _temp) = setup_delete_test().await;
         let args = json!({ "doc_path": "../outside.md" });
-        let err = handle_delete_doc(&db, &config, &args).await.unwrap_err();
+        let err = handle_delete_doc(&db, &config, &args, None).await.unwrap_err();
         match err {
             RagmcpError::InvalidInput(msg) => assert!(msg.contains("traversal") || msg.contains("..")),
             other => panic!("expected InvalidInput, got {:?}", other),
@@ -1597,7 +1657,7 @@ mod tests {
     async fn test_handle_delete_doc_missing_errors() {
         let (db, config, _temp) = setup_delete_test().await;
         let args = json!({ "doc_path": "Missing/nowhere.md" });
-        let err = handle_delete_doc(&db, &config, &args).await.unwrap_err();
+        let err = handle_delete_doc(&db, &config, &args, None).await.unwrap_err();
         match err {
             RagmcpError::DocumentNotFound(p) => assert_eq!(p, "Missing/nowhere.md"),
             other => panic!("expected DocumentNotFound, got {:?}", other),

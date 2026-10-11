@@ -10,6 +10,7 @@ pub mod graph;
 pub mod pageindex;
 pub mod watch;
 pub mod eval;
+pub mod storage;
 
 pub use config::Config;
 pub use error::{RagmcpError, Result};

@@ -16,7 +16,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Database (simplified to rusqlite)
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 
 # HTTP & Embeddings
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
@@ -43,9 +43,12 @@ dotenv = "0.15"
 
 # Crypto & Utilities
 sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
 uuid = { version = "1.18", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
+percent-encoding = "2.3"
 
 # File System & Parsing
 walkdir = "2.5"

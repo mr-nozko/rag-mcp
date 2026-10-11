@@ -9,9 +9,11 @@
 *.db
 *.db-shm
 *.db-wal
+*.db-journal
 
 # Config (may contain secrets)
 config.toml
+config.server.toml
 *.local.toml
 cloudflared-config.yaml
 
