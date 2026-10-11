@@ -190,6 +190,38 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+/// Prefer a non-empty env var over the TOML value.
+/// Why: public repos / Render deploy leave placeholders in git; real values come from host env.
+fn resolve_r2_env_or_toml(env_key: &str, toml_value: &str) -> String {
+    match std::env::var(env_key) {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => toml_value.to_string(),
+    }
+}
+
+/// True when bucket is empty or still a documented placeholder (unsafe to use as-is).
+fn r2_bucket_looks_unconfigured(bucket: &str) -> bool {
+    let b = bucket.trim();
+    b.is_empty() || b == "your-bucket-name" || b.contains("<accountid>")
+}
+
+/// True when endpoint is empty or still contains the example account-id placeholder.
+fn r2_endpoint_looks_unconfigured(endpoint: &str) -> bool {
+    let e = endpoint.trim();
+    e.is_empty() || e.contains("<accountid>")
+}
+
+/// Host (or full URL fallback) for info logs — avoids dumping credentials.
+fn r2_endpoint_host_for_log(endpoint: &str) -> &str {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    // Strip scheme so logs show host only when possible.
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    without_scheme.split('/').next().unwrap_or(without_scheme)
+}
+
 impl Config {
     /// Load configuration from file
     /// 
@@ -248,6 +280,10 @@ impl Config {
 
     /// Build an R2 client when `[storage.r2]` + env credentials are available.
     /// Works even if backend!=r2 (for `pull-r2`).
+    ///
+    /// Bucket / endpoint / snapshot key prefer env over TOML so a public repo can
+    /// ship placeholders (e.g. `config.server.toml.example`) while Render sets
+    /// `R2_BUCKET` / `R2_ENDPOINT` at deploy time.
     pub fn r2_client_from_config(&self) -> Result<crate::storage::R2Client> {
         let r2 = self
             .storage
@@ -258,6 +294,22 @@ impl Config {
                     "Missing [storage.r2] in config. Required for R2 mode / pull-r2."
                 )
             })?;
+
+        // Env wins over TOML: public git must not require real bucket/endpoint values.
+        let bucket = resolve_r2_env_or_toml("R2_BUCKET", &r2.bucket);
+        let endpoint = resolve_r2_env_or_toml("R2_ENDPOINT", &r2.endpoint);
+        let snapshot_key = resolve_r2_env_or_toml("R2_SNAPSHOT_KEY", &r2.snapshot_key);
+
+        if r2_bucket_looks_unconfigured(&bucket) || r2_endpoint_looks_unconfigured(&endpoint) {
+            anyhow::bail!(
+                "R2 bucket/endpoint not configured. Set environment variables R2_BUCKET and \
+                 R2_ENDPOINT (recommended on Render), or replace placeholders in [storage.r2]. \
+                 Got bucket={:?} endpoint={:?}.",
+                bucket,
+                endpoint
+            );
+        }
+
         let access_key = std::env::var(&r2.access_key_env).with_context(|| {
             format!(
                 "Environment variable {} not set (R2 access key)",
@@ -270,14 +322,16 @@ impl Config {
                 r2.secret_key_env
             )
         })?;
-        crate::storage::R2Client::new(
-            r2.bucket.clone(),
-            r2.endpoint.clone(),
-            access_key,
-            secret_key,
-            r2.snapshot_key.clone(),
-        )
-        .map_err(|e| anyhow::anyhow!("{}", e))
+
+        // Bucket name + endpoint host are not secrets; never log access/secret keys.
+        log::info!(
+            "R2 client using bucket={} endpoint={}",
+            bucket,
+            r2_endpoint_host_for_log(&endpoint)
+        );
+
+        crate::storage::R2Client::new(bucket, endpoint, access_key, secret_key, snapshot_key)
+            .map_err(|e| anyhow::anyhow!("{}", e))
     }
     
     /// Validate configuration values
@@ -500,6 +554,156 @@ chunk_overlap_tokens = 50
         std::env::remove_var("RAGMCP_CONFIG");
         if let Some(v) = original {
             std::env::set_var("RAGMCP_CONFIG", v);
+        }
+    }
+
+    #[test]
+    fn test_r2_env_overrides_and_placeholder_detection() {
+        let _lock = CONFIG_TEST_LOCK.lock().unwrap();
+
+        // Save / restore R2_* so we don't leak into other tests.
+        let saved_bucket = std::env::var("R2_BUCKET").ok();
+        let saved_endpoint = std::env::var("R2_ENDPOINT").ok();
+        let saved_snap = std::env::var("R2_SNAPSHOT_KEY").ok();
+        std::env::remove_var("R2_BUCKET");
+        std::env::remove_var("R2_ENDPOINT");
+        std::env::remove_var("R2_SNAPSHOT_KEY");
+
+        assert_eq!(
+            resolve_r2_env_or_toml("R2_BUCKET", "toml-bucket"),
+            "toml-bucket"
+        );
+        std::env::set_var("R2_BUCKET", "env-bucket");
+        assert_eq!(
+            resolve_r2_env_or_toml("R2_BUCKET", "toml-bucket"),
+            "env-bucket"
+        );
+        // Empty env must not override TOML.
+        std::env::set_var("R2_BUCKET", "   ");
+        assert_eq!(
+            resolve_r2_env_or_toml("R2_BUCKET", "toml-bucket"),
+            "toml-bucket"
+        );
+
+        assert!(r2_bucket_looks_unconfigured(""));
+        assert!(r2_bucket_looks_unconfigured("your-bucket-name"));
+        assert!(r2_bucket_looks_unconfigured("x-<accountid>-y"));
+        assert!(!r2_bucket_looks_unconfigured("ragmcp-docs"));
+
+        assert!(r2_endpoint_looks_unconfigured(""));
+        assert!(r2_endpoint_looks_unconfigured(
+            "https://<accountid>.r2.cloudflarestorage.com"
+        ));
+        assert!(!r2_endpoint_looks_unconfigured(
+            "https://abc123.r2.cloudflarestorage.com"
+        ));
+
+        assert_eq!(
+            r2_endpoint_host_for_log("https://abc123.r2.cloudflarestorage.com/path"),
+            "abc123.r2.cloudflarestorage.com"
+        );
+
+        // Restore prior env.
+        std::env::remove_var("R2_BUCKET");
+        std::env::remove_var("R2_ENDPOINT");
+        std::env::remove_var("R2_SNAPSHOT_KEY");
+        if let Some(v) = saved_bucket {
+            std::env::set_var("R2_BUCKET", v);
+        }
+        if let Some(v) = saved_endpoint {
+            std::env::set_var("R2_ENDPOINT", v);
+        }
+        if let Some(v) = saved_snap {
+            std::env::set_var("R2_SNAPSHOT_KEY", v);
+        }
+    }
+
+    #[test]
+    fn test_r2_client_rejects_placeholder_bucket_endpoint() {
+        let _lock = CONFIG_TEST_LOCK.lock().unwrap();
+
+        let saved_bucket = std::env::var("R2_BUCKET").ok();
+        let saved_endpoint = std::env::var("R2_ENDPOINT").ok();
+        let saved_ak = std::env::var("R2_ACCESS_KEY_ID").ok();
+        let saved_sk = std::env::var("R2_SECRET_ACCESS_KEY").ok();
+        std::env::remove_var("R2_BUCKET");
+        std::env::remove_var("R2_ENDPOINT");
+        std::env::set_var("R2_ACCESS_KEY_ID", "test-ak");
+        std::env::set_var("R2_SECRET_ACCESS_KEY", "test-sk");
+
+        let cfg = Config {
+            ragmcp: RagmcpConfig {
+                rag_folder: PathBuf::from("."),
+                db_path: PathBuf::from("./t.db"),
+                log_level: "info".into(),
+            },
+            embeddings: EmbeddingsConfig {
+                provider: "openai".into(),
+                model: "text-embedding-3-small".into(),
+                api_key_env: "OPENAI_API_KEY".into(),
+                batch_size: 100,
+                dimensions: 1536,
+                cache_capacity: 1000,
+            },
+            search: SearchConfig {
+                default_k: 5,
+                min_score: 0.65,
+                hybrid_bm25_weight: 0.5,
+                hybrid_vector_weight: 0.5,
+            },
+            performance: PerformanceConfig {
+                max_latency_ms: 1000,
+                chunk_size_tokens: 300,
+                chunk_overlap_tokens: 50,
+            },
+            http_server: HttpServerConfig::default(),
+            pageindex: PageIndexConfig::default(),
+            storage: Some(StorageConfig {
+                backend: "r2".into(),
+                cache_dir: Some(PathBuf::from("/tmp/docs")),
+                r2: Some(R2StorageConfig {
+                    bucket: "your-bucket-name".into(),
+                    endpoint: "https://<accountid>.r2.cloudflarestorage.com".into(),
+                    access_key_env: default_r2_access_key_env(),
+                    secret_key_env: default_r2_secret_key_env(),
+                    snapshot_key: default_r2_snapshot_key(),
+                }),
+            }),
+        };
+
+        let err = match cfg.r2_client_from_config() {
+            Ok(_) => panic!("expected placeholder rejection"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("R2_BUCKET") && err.contains("R2_ENDPOINT"),
+            "unexpected error: {}",
+            err
+        );
+
+        // Env overrides fix placeholders without editing TOML.
+        std::env::set_var("R2_BUCKET", "real-bucket");
+        std::env::set_var(
+            "R2_ENDPOINT",
+            "https://abc123.r2.cloudflarestorage.com",
+        );
+        assert!(cfg.r2_client_from_config().is_ok());
+
+        std::env::remove_var("R2_BUCKET");
+        std::env::remove_var("R2_ENDPOINT");
+        std::env::remove_var("R2_ACCESS_KEY_ID");
+        std::env::remove_var("R2_SECRET_ACCESS_KEY");
+        if let Some(v) = saved_bucket {
+            std::env::set_var("R2_BUCKET", v);
+        }
+        if let Some(v) = saved_endpoint {
+            std::env::set_var("R2_ENDPOINT", v);
+        }
+        if let Some(v) = saved_ak {
+            std::env::set_var("R2_ACCESS_KEY_ID", v);
+        }
+        if let Some(v) = saved_sk {
+            std::env::set_var("R2_SECRET_ACCESS_KEY", v);
         }
     }
 }

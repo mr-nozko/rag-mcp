@@ -23,6 +23,9 @@ COPY migrations ./migrations
 COPY config.server.toml.example ./config.server.toml.example
 
 ENV RUST_LOG=info
+# Default server config baked into the image (bucket/endpoint edited in repo;
+# secrets come from platform env vars — never from this file).
+ENV RAGMCP_CONFIG=/app/config.server.toml.example
 # Railway/Render set PORT; binary binds 0.0.0.0:$PORT when present
 EXPOSE 8080
 

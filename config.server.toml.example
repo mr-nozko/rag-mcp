@@ -40,6 +40,8 @@ backend = "r2"
 cache_dir = "/tmp/docs"
 
 [storage.r2]
+# Placeholders are fine in git. On the host, set R2_BUCKET and R2_ENDPOINT
+# (they override these fields). Optionally R2_SNAPSHOT_KEY overrides snapshot_key.
 bucket = "your-bucket-name"
 endpoint = "https://<accountid>.r2.cloudflarestorage.com"
 access_key_env = "R2_ACCESS_KEY_ID"
