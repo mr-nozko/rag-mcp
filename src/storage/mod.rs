@@ -18,20 +18,33 @@ use crate::ingest::{
     classify_files, discover_files, get_existing_hashes, ingest_file, ParserRegistry,
 };
 
+/// Outcome of an incremental ingest + embed bootstrap pass.
+#[derive(Debug, Clone, Copy)]
+pub struct BootstrapStatus {
+    /// True when at least one file was ingested or at least one embedding was stored.
+    pub db_changed: bool,
+}
+
 /// Run one incremental ingest pass + embed any chunks missing embeddings.
-/// Used on R2 cold boot when no SQLite snapshot exists yet.
-pub async fn bootstrap_index(db: &Db, config: &Config, embedder: &OpenAIEmbedder) -> Result<()> {
+/// Called after every R2 restore (reconcile after snapshot, or cold bootstrap when none exists).
+pub async fn bootstrap_index(
+    db: &Db,
+    config: &Config,
+    embedder: &OpenAIEmbedder,
+) -> Result<BootstrapStatus> {
     let root = config.rag_folder();
     log::info!("R2 bootstrap: incremental ingest from {}", root.display());
 
     let files = discover_files(root)?;
     if files.is_empty() {
+        // Empty corpus is a no-op — callers may still upload an initial snapshot.
         log::warn!("R2 bootstrap: no documents found under {}", root.display());
-        return Ok(());
+        return Ok(BootstrapStatus { db_changed: false });
     }
 
     let existing_hashes = get_existing_hashes(db).await?;
     let classification = classify_files(&files, &existing_hashes)?;
+    // Skip unchanged hashes — only new/modified files are ingested.
     let to_process: Vec<_> = classification
         .new_files
         .into_iter()
@@ -39,20 +52,20 @@ pub async fn bootstrap_index(db: &Db, config: &Config, embedder: &OpenAIEmbedder
         .collect();
 
     let registry = ParserRegistry::new();
-    let mut ok = 0usize;
+    let mut ingested_ok = 0usize;
     let mut err = 0usize;
     for file in &to_process {
         match ingest_file(db, file, &registry, config).await {
-            Ok(_) => ok += 1,
+            Ok(_) => ingested_ok += 1,
             Err(e) => {
                 err += 1;
                 log::error!("R2 bootstrap ingest failed for {}: {}", file.relative_path, e);
             }
         }
     }
-    log::info!("R2 bootstrap ingest: {} ok, {} errors", ok, err);
+    log::info!("R2 bootstrap ingest: {} ok, {} errors", ingested_ok, err);
 
-    // Embed chunks that still lack vectors (same query shape as embed CLI).
+    // Embed only chunks that still lack vectors (same query shape as embed CLI).
     let chunks = db
         .with_connection(|conn| {
             let mut stmt =
@@ -68,18 +81,24 @@ pub async fn bootstrap_index(db: &Db, config: &Config, embedder: &OpenAIEmbedder
 
     if chunks.is_empty() {
         log::info!("R2 bootstrap: all chunks already embedded");
-        return Ok(());
+        return Ok(BootstrapStatus {
+            db_changed: ingested_ok > 0,
+        });
     }
 
     let batch_size = config.embeddings.batch_size.max(1);
     log::info!("R2 bootstrap: embedding {} chunks (batch={})", chunks.len(), batch_size);
+    let mut embedded_count = 0usize;
     for batch in chunks.chunks(batch_size) {
         let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
         let embeddings = embedder.embed_batch(texts).await?;
         for ((chunk_id, _), embedding) in batch.iter().zip(embeddings.into_iter()) {
             store_embedding(db, chunk_id, &embedding).await?;
+            embedded_count += 1;
         }
     }
 
-    Ok(())
+    Ok(BootstrapStatus {
+        db_changed: ingested_ok > 0 || embedded_count > 0,
+    })
 }

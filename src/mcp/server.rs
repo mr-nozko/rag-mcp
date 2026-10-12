@@ -332,6 +332,7 @@ impl McpServer {
                     &self.db,
                     &self.config,
                     &params.arguments,
+                    self.chunk_cache.clone(),
                     self.r2.clone(),
                 )
                 .await?

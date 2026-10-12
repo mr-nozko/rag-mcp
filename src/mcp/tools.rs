@@ -24,19 +24,22 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 /// After a successful local write, mirror the object to R2 and upload a SQLite snapshot.
+/// Returns whether the snapshot upload succeeded (`true` when R2 is None / local mode).
 /// Search/get/watcher never call this — only create/update/delete write-through.
 async fn r2_write_through_put(
     r2: &Option<Arc<R2Client>>,
     db_path: &Path,
     relative_path: &str,
     absolute_path: &Path,
-) {
-    let Some(client) = r2 else { return };
+) -> bool {
+    // Local mode: no remote snapshot to fail — treat as success so callers stay green.
+    let Some(client) = r2 else { return true };
     match fs::read(absolute_path) {
         Ok(bytes) => {
             if let Err(e) = client.put_document(relative_path, &bytes).await {
                 log::error!("R2 write-through put failed for {}: {}", relative_path, e);
-                return;
+                // Object not mirrored — report snapshot as failed (not attempted).
+                return false;
             }
         }
         Err(e) => {
@@ -45,27 +48,49 @@ async fn r2_write_through_put(
                 absolute_path.display(),
                 e
             );
-            return;
+            return false;
         }
     }
-    if let Err(e) = client.upload_snapshot(db_path).await {
-        log::error!("R2 snapshot upload after put failed: {}", e);
+    match client.upload_snapshot(db_path).await {
+        Ok(()) => true,
+        Err(e) => {
+            log::error!("R2 snapshot upload after put failed: {}", e);
+            false
+        }
     }
 }
 
 /// After a successful local delete, remove the R2 object and upload a SQLite snapshot.
+/// Retries object delete once; on object failure logs but always attempts snapshot.
+/// Returns whether the snapshot upload succeeded (`true` when R2 is None / local mode).
 async fn r2_write_through_delete(
     r2: &Option<Arc<R2Client>>,
     db_path: &Path,
     relative_path: &str,
-) {
-    let Some(client) = r2 else { return };
+) -> bool {
+    // Local mode: no remote snapshot to fail — treat as success so callers stay green.
+    let Some(client) = r2 else { return true };
     if let Err(e) = client.delete_document(relative_path).await {
-        log::error!("R2 write-through delete failed for {}: {}", relative_path, e);
-        return;
+        log::error!(
+            "R2 write-through delete failed for {}: {}; retrying once",
+            relative_path,
+            e
+        );
+        if let Err(e2) = client.delete_document(relative_path).await {
+            // Do not return early — snapshot must still be attempted so remote DB stays current.
+            log::error!(
+                "R2 write-through delete retry failed for {}: {}",
+                relative_path,
+                e2
+            );
+        }
     }
-    if let Err(e) = client.upload_snapshot(db_path).await {
-        log::error!("R2 snapshot upload after delete failed: {}", e);
+    match client.upload_snapshot(db_path).await {
+        Ok(()) => true,
+        Err(e) => {
+            log::error!("R2 snapshot upload after delete failed: {}", e);
+            false
+        }
     }
 }
 
@@ -922,7 +947,7 @@ pub async fn handle_create_doc(
     db: &Db,
     embedder: &OpenAIEmbedder,
     config: &Config,
-    _cache: Option<Arc<ChunkEmbeddingCache>>,
+    cache: Option<Arc<ChunkEmbeddingCache>>,
     arguments: &Value,
     pageindex: Option<Arc<crate::pageindex::PageIndexManager>>,
     r2: Option<Arc<R2Client>>,
@@ -1005,6 +1030,10 @@ pub async fn handle_create_doc(
         chunk_count,
         embedded
     );
+    // Invalidate in-memory vectors so next search reloads from the updated DB.
+    if let Some(ref cache) = cache {
+        cache.clear();
+    }
 
     let meta_json = json!({
         "doc_type": doc_type,
@@ -1024,48 +1053,73 @@ pub async fn handle_create_doc(
     )
     .await?;
 
-    let text = json!({
-        "success": true,
-        "doc_id": doc_id,
-        "doc_path": doc_path,
-        "chunks_created": chunk_count,
-        "embeddings_stored": embedded,
-        "operation_id": operation_id,
-        "message": "Document created successfully"
-    })
-    .to_string();
-
     if let Some(pi) = pageindex {
         let pi_clone = pi.clone();
         let path_clone = doc_path.clone();
         let doc_id_clone = doc_id.clone();
         let db_path = config.db_path().to_path_buf();
         let model_clone = config.pageindex.default_model.clone();
+        // Clone R2 into spawn so PageIndex metadata lands in the remote snapshot too.
+        let r2_for_pi = r2.clone();
         tokio::spawn(async move {
             let db = crate::db::Db::new(&db_path);
             if let Ok(resp) = pi_clone.index_document(&path_clone, &model_clone).await {
                 let node_count = resp.node_count.unwrap_or(0);
                 let tree_path = resp.tree_path;
-                let _ = db.with_connection(move |conn| {
+                let insert_ok = db.with_connection(move |conn| {
                     conn.execute(
                         "INSERT OR REPLACE INTO pageindex_index (doc_id, doc_path, tree_path, tree_built_at, tree_node_count, model_used) VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, ?)",
                         rusqlite::params![doc_id_clone, path_clone, tree_path, node_count, model_clone]
                     )?;
                     Ok::<_, RagmcpError>(())
                 }).await;
+                // After pageindex_index is durable, push a fresh snapshot when R2 is configured.
+                if insert_ok.is_ok() {
+                    if let Some(client) = r2_for_pi {
+                        if let Err(e) = client.upload_snapshot(&db_path).await {
+                            log::error!("R2 snapshot upload after pageindex (create) failed: {}", e);
+                        }
+                    }
+                }
             }
         });
     }
 
     // R2 write-through: object + snapshot (no-op when r2 is None / local mode)
-    r2_write_through_put(&r2, config.db_path(), &doc_path, &absolute_path).await;
+    let snapshot_ok = r2_write_through_put(&r2, config.db_path(), &doc_path, &absolute_path).await;
+    // Live index succeeded; surface R2 snapshot failure so the client can retry/alert.
+    let r2_snapshot_failed = r2.is_some() && !snapshot_ok;
+    let text = if r2_snapshot_failed {
+        json!({
+            "success": true,
+            "doc_id": doc_id,
+            "doc_path": doc_path,
+            "chunks_created": chunk_count,
+            "embeddings_stored": embedded,
+            "operation_id": operation_id,
+            "r2_snapshot_ok": false,
+            "message": "Document created in live index, but R2 snapshot upload failed"
+        })
+        .to_string()
+    } else {
+        json!({
+            "success": true,
+            "doc_id": doc_id,
+            "doc_path": doc_path,
+            "chunks_created": chunk_count,
+            "embeddings_stored": embedded,
+            "operation_id": operation_id,
+            "message": "Document created successfully"
+        })
+        .to_string()
+    };
 
     Ok(ToolsCallResult {
         content: vec![ContentItem {
             content_type: "text".to_string(),
             text,
         }],
-        is_error: None,
+        is_error: if r2_snapshot_failed { Some(true) } else { None },
     })
 }
 
@@ -1087,7 +1141,7 @@ pub async fn handle_update_doc(
     db: &Db,
     embedder: &OpenAIEmbedder,
     config: &Config,
-    _cache: Option<Arc<ChunkEmbeddingCache>>,
+    cache: Option<Arc<ChunkEmbeddingCache>>,
     arguments: &Value,
     pageindex: Option<Arc<crate::pageindex::PageIndexManager>>,
     r2: Option<Arc<R2Client>>,
@@ -1169,6 +1223,10 @@ pub async fn handle_update_doc(
         chunk_count,
         embedded
     );
+    // Invalidate in-memory vectors so next search reloads from the updated DB.
+    if let Some(ref cache) = cache {
+        cache.clear();
+    }
 
     let meta_json = json!({
         "doc_type": doc_type,
@@ -1188,48 +1246,73 @@ pub async fn handle_update_doc(
     )
     .await?;
 
-    let text = json!({
-        "success": true,
-        "doc_id": doc_id,
-        "doc_path": doc_path,
-        "chunks_created": chunk_count,
-        "embeddings_stored": embedded,
-        "operation_id": operation_id,
-        "message": "Document updated successfully"
-    })
-    .to_string();
-
     if let Some(pi) = pageindex {
         let pi_clone = pi.clone();
         let path_clone = doc_path.clone();
         let doc_id_clone = doc_id.clone();
         let db_path = config.db_path().to_path_buf();
         let model_clone = config.pageindex.default_model.clone();
+        // Clone R2 into spawn so PageIndex metadata lands in the remote snapshot too.
+        let r2_for_pi = r2.clone();
         tokio::spawn(async move {
             let db = crate::db::Db::new(&db_path);
             if let Ok(resp) = pi_clone.index_document(&path_clone, &model_clone).await {
                 let node_count = resp.node_count.unwrap_or(0);
                 let tree_path = resp.tree_path;
-                let _ = db.with_connection(move |conn| {
+                let insert_ok = db.with_connection(move |conn| {
                     conn.execute(
                         "INSERT OR REPLACE INTO pageindex_index (doc_id, doc_path, tree_path, tree_built_at, tree_node_count, model_used) VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, ?)",
                         rusqlite::params![doc_id_clone, path_clone, tree_path, node_count, model_clone]
                     )?;
                     Ok::<_, RagmcpError>(())
                 }).await;
+                // After pageindex_index is durable, push a fresh snapshot when R2 is configured.
+                if insert_ok.is_ok() {
+                    if let Some(client) = r2_for_pi {
+                        if let Err(e) = client.upload_snapshot(&db_path).await {
+                            log::error!("R2 snapshot upload after pageindex (update) failed: {}", e);
+                        }
+                    }
+                }
             }
         });
     }
 
     // R2 write-through: object + snapshot (no-op when r2 is None / local mode)
-    r2_write_through_put(&r2, config.db_path(), &doc_path, &absolute_path).await;
+    let snapshot_ok = r2_write_through_put(&r2, config.db_path(), &doc_path, &absolute_path).await;
+    // Live index succeeded; surface R2 snapshot failure so the client can retry/alert.
+    let r2_snapshot_failed = r2.is_some() && !snapshot_ok;
+    let text = if r2_snapshot_failed {
+        json!({
+            "success": true,
+            "doc_id": doc_id,
+            "doc_path": doc_path,
+            "chunks_created": chunk_count,
+            "embeddings_stored": embedded,
+            "operation_id": operation_id,
+            "r2_snapshot_ok": false,
+            "message": "Document updated in live index, but R2 snapshot upload failed"
+        })
+        .to_string()
+    } else {
+        json!({
+            "success": true,
+            "doc_id": doc_id,
+            "doc_path": doc_path,
+            "chunks_created": chunk_count,
+            "embeddings_stored": embedded,
+            "operation_id": operation_id,
+            "message": "Document updated successfully"
+        })
+        .to_string()
+    };
 
     Ok(ToolsCallResult {
         content: vec![ContentItem {
             content_type: "text".to_string(),
             text,
         }],
-        is_error: None,
+        is_error: if r2_snapshot_failed { Some(true) } else { None },
     })
 }
 
@@ -1244,6 +1327,7 @@ pub async fn handle_delete_doc(
     db: &Db,
     config: &Config,
     arguments: &Value,
+    cache: Option<Arc<ChunkEmbeddingCache>>,
     r2: Option<Arc<R2Client>>,
 ) -> Result<ToolsCallResult> {
     let params: DeleteDocParams = serde_json::from_value(arguments.clone())
@@ -1274,6 +1358,12 @@ pub async fn handle_delete_doc(
     // Remove index rows (slash-variant safe) + PageIndex + agent relations
     let index_result = delete_documents_normalized(db, &doc_path).await?;
     let deleted_from_index = index_result.deleted_count > 0;
+    // After a successful index delete, drop cached embeddings so search cannot return ghosts.
+    if deleted_from_index {
+        if let Some(ref cache) = cache {
+            cache.clear();
+        }
+    }
 
     if !deleted_from_disk && !deleted_from_index {
         let _ = log_operation(
@@ -1308,26 +1398,41 @@ pub async fn handle_delete_doc(
     )
     .await?;
 
-    let text = json!({
-        "success": true,
-        "doc_path": doc_path,
-        "doc_id": index_result.doc_id,
-        "deleted_from_disk": deleted_from_disk,
-        "deleted_from_index": deleted_from_index,
-        "operation_id": operation_id,
-        "message": "Document deleted successfully"
-    })
-    .to_string();
-
     // R2 write-through: delete object + snapshot (no-op when r2 is None / local mode)
-    r2_write_through_delete(&r2, config.db_path(), &doc_path).await;
+    let snapshot_ok = r2_write_through_delete(&r2, config.db_path(), &doc_path).await;
+    // Live index succeeded; surface R2 snapshot failure so the client can retry/alert.
+    let r2_snapshot_failed = r2.is_some() && !snapshot_ok;
+    let text = if r2_snapshot_failed {
+        json!({
+            "success": true,
+            "doc_path": doc_path,
+            "doc_id": index_result.doc_id,
+            "deleted_from_disk": deleted_from_disk,
+            "deleted_from_index": deleted_from_index,
+            "operation_id": operation_id,
+            "r2_snapshot_ok": false,
+            "message": "Document deleted from live index, but R2 snapshot upload failed"
+        })
+        .to_string()
+    } else {
+        json!({
+            "success": true,
+            "doc_path": doc_path,
+            "doc_id": index_result.doc_id,
+            "deleted_from_disk": deleted_from_disk,
+            "deleted_from_index": deleted_from_index,
+            "operation_id": operation_id,
+            "message": "Document deleted successfully"
+        })
+        .to_string()
+    };
 
     Ok(ToolsCallResult {
         content: vec![ContentItem {
             content_type: "text".to_string(),
             text,
         }],
-        is_error: None,
+        is_error: if r2_snapshot_failed { Some(true) } else { None },
     })
 }
 
@@ -1628,7 +1733,7 @@ mod tests {
         .unwrap();
 
         let args = json!({ "doc_path": rel });
-        let result = handle_delete_doc(&db, &config, &args, None).await.unwrap();
+        let result = handle_delete_doc(&db, &config, &args, None, None).await.unwrap();
         assert!(result.is_error.is_none());
         assert!(!file.exists(), "file should be deleted from disk");
 
@@ -1646,7 +1751,7 @@ mod tests {
     async fn test_handle_delete_doc_traversal_blocked() {
         let (db, config, _temp) = setup_delete_test().await;
         let args = json!({ "doc_path": "../outside.md" });
-        let err = handle_delete_doc(&db, &config, &args, None).await.unwrap_err();
+        let err = handle_delete_doc(&db, &config, &args, None, None).await.unwrap_err();
         match err {
             RagmcpError::InvalidInput(msg) => assert!(msg.contains("traversal") || msg.contains("..")),
             other => panic!("expected InvalidInput, got {:?}", other),
@@ -1657,7 +1762,7 @@ mod tests {
     async fn test_handle_delete_doc_missing_errors() {
         let (db, config, _temp) = setup_delete_test().await;
         let args = json!({ "doc_path": "Missing/nowhere.md" });
-        let err = handle_delete_doc(&db, &config, &args, None).await.unwrap_err();
+        let err = handle_delete_doc(&db, &config, &args, None, None).await.unwrap_err();
         match err {
             RagmcpError::DocumentNotFound(p) => assert_eq!(p, "Missing/nowhere.md"),
             other => panic!("expected DocumentNotFound, got {:?}", other),

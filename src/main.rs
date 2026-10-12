@@ -91,7 +91,7 @@ fn maybe_r2_client(config: &Config) -> Result<Option<Arc<R2Client>>> {
     }
 }
 
-/// Restore snapshot + hydrate docs; bootstrap index if no snapshot; set ready; start watcher.
+/// Restore snapshot + hydrate docs; always reconcile via bootstrap_index; set ready; start watcher.
 async fn r2_restore_and_ready(
     config: Config,
     db: Db,
@@ -126,13 +126,31 @@ async fn r2_restore_and_ready(
         log::error!("R2 hydrate failed: {}", e);
     }
 
-    if !had_snapshot {
-        log::info!("R2 restore: no snapshot — running incremental ingest + embed once");
-        if let Err(e) = storage::bootstrap_index(&db, &config, &embedder).await {
+    // Always reconcile after hydrate so docs added to R2 after the last snapshot are indexed.
+    if had_snapshot {
+        log::info!("R2 restore: reconciling index after snapshot (ingest new/changed + embed missing)");
+    } else {
+        log::info!("R2 restore: no snapshot — cold bootstrap (incremental ingest + embed)");
+    }
+    let db_changed = match storage::bootstrap_index(&db, &config, &embedder).await {
+        Ok(status) => status.db_changed,
+        Err(e) => {
             log::error!("R2 bootstrap ingest/embed failed: {}", e);
-        } else if let Err(e) = r2.upload_snapshot(&db_path).await {
-            log::error!("R2 initial snapshot upload failed: {}", e);
+            false
         }
+    };
+
+    // Initial snapshot always when none existed; otherwise only when bootstrap mutated the DB.
+    if !had_snapshot || db_changed {
+        if let Err(e) = r2.upload_snapshot(&db_path).await {
+            log::error!("R2 snapshot upload after bootstrap failed: {}", e);
+        } else if !had_snapshot {
+            log::info!("R2 restore: uploaded initial snapshot");
+        } else {
+            log::info!("R2 restore: uploaded reconciled snapshot (db_changed=true)");
+        }
+    } else {
+        log::info!("R2 restore: snapshot unchanged — skipping upload");
     }
 
     let _ = log_db_stats(&db).await;
