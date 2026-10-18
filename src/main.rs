@@ -122,8 +122,11 @@ async fn r2_restore_and_ready(
     }
 
     log::info!("R2 restore: hydrating documents into {}", cache_dir.display());
+    // Fail closed: do not bootstrap, upload snapshot, set ready, or start watcher on hydrate Err.
+    // Mid-hydrate now writes the cache marker early so a later retry is not latched.
     if let Err(e) = hydrate_docs(&r2, &cache_dir).await {
-        log::error!("R2 hydrate failed: {}", e);
+        log::error!("R2 hydrate failed — leaving ready=false (no bootstrap/snapshot/watcher): {}", e);
+        return;
     }
 
     // Always reconcile after hydrate so docs added to R2 after the last snapshot are indexed.

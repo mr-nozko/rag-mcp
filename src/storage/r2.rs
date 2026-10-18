@@ -19,9 +19,14 @@ use std::time::Duration;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Marker file written into cache_dir after a successful hydrate.
+/// Marker file that claims RAGMcp R2 ownership of cache_dir after the safety check.
+/// Written before the download loop (not only after a fully successful hydrate) so a
+/// mid-hydrate failure does not leave unmarked files that latch assert_cache_dir_safe.
 /// Safety: refuse to use a non-empty cache_dir that lacks this marker.
 pub const CACHE_MARKER_NAME: &str = ".ragmcp-r2-cache";
+
+/// Marker payload — stable bytes so ownership is recognizable across retries.
+const CACHE_MARKER_BYTES: &[u8] = b"ragmcp-r2-cache\n";
 
 /// Default object key for the SQLite snapshot inside the bucket.
 pub const DEFAULT_SNAPSHOT_KEY: &str = "_ragmcp/ragmcp.db";
@@ -67,6 +72,12 @@ pub fn assert_cache_dir_safe(cache_dir: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Claim ownership of `cache_dir` so a mid-hydrate failure can still retry safely.
+/// Idempotent: safe to call again after a successful hydrate (refreshes marker bytes).
+pub fn write_cache_marker(cache_dir: &Path) -> Result<()> {
+    fs::write(cache_dir.join(CACHE_MARKER_NAME), CACHE_MARKER_BYTES).map_err(RagmcpError::Io)
 }
 
 /// Counters for API-economy monitoring (list/get/put/delete).
@@ -506,10 +517,15 @@ pub fn resolve_pull_path(root: &Path, key: &str) -> Result<Option<PathBuf>> {
 }
 
 /// Hydrate documents from R2 into `cache_dir`. Never deletes local files.
-/// Downloads missing or size-mismatched objects; writes the safety marker.
+/// Downloads missing or size-mismatched objects; claims ownership via marker before downloads.
 pub async fn hydrate_docs(client: &R2Client, cache_dir: &Path) -> Result<usize> {
+    // Refuse foreign/unmarked non-empty dirs before we claim or write anything.
     assert_cache_dir_safe(cache_dir)?;
     fs::create_dir_all(cache_dir).map_err(RagmcpError::Io)?;
+
+    // Claim ownership BEFORE the download loop so a mid-hydrate failure leaves a marked
+    // cache that assert_cache_dir_safe will accept on retry (avoids permanent latch).
+    write_cache_marker(cache_dir)?;
 
     let objects = client.list_objects().await?;
     let mut downloaded = 0usize;
@@ -542,12 +558,8 @@ pub async fn hydrate_docs(client: &R2Client, cache_dir: &Path) -> Result<usize> 
         log::debug!("R2 hydrate: wrote {} ({} bytes)", local.display(), bytes.len());
     }
 
-    // Marker proves this directory is an R2 cache owned by RAGMcp.
-    fs::write(
-        cache_dir.join(CACHE_MARKER_NAME),
-        b"ragmcp-r2-cache\n",
-    )
-    .map_err(RagmcpError::Io)?;
+    // Idempotent refresh after successful hydrate — keeps end-of-path ownership explicit.
+    write_cache_marker(cache_dir)?;
 
     log::info!(
         "R2 hydrate complete: {} object(s) downloaded into {}",
@@ -739,6 +751,29 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join(CACHE_MARKER_NAME), b"ok").unwrap();
         fs::write(tmp.path().join("doc.md"), b"hi").unwrap();
+        assert!(assert_cache_dir_safe(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn test_marker_safety_ok_after_write_cache_marker_helper() {
+        // Early ownership claim (same path hydrate_docs uses before downloads).
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("partial.md"), b"mid-hydrate").unwrap();
+        write_cache_marker(tmp.path()).unwrap();
+        assert!(assert_cache_dir_safe(tmp.path()).is_ok());
+        let written = fs::read(tmp.path().join(CACHE_MARKER_NAME)).unwrap();
+        assert_eq!(written, CACHE_MARKER_BYTES);
+    }
+
+    #[test]
+    fn test_marker_latch_retry_after_ownership_claimed() {
+        // Documents the pre-fix latch: unmarked non-empty dir fails forever until
+        // ownership is claimed; once the marker exists, assert passes and hydrate can retry.
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("orphaned.md"), b"from failed hydrate").unwrap();
+        let err = assert_cache_dir_safe(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains(CACHE_MARKER_NAME));
+        write_cache_marker(tmp.path()).unwrap();
         assert!(assert_cache_dir_safe(tmp.path()).is_ok());
     }
 
