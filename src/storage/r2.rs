@@ -498,10 +498,33 @@ fn content_type_for_path(key: &str) -> &'static str {
     }
 }
 
+/// True when hydrate/pull should not write to `local` because it is already a directory.
+/// Nested R2 docs (e.g. `Business/foo.md`) create `Business/` locally; a bare or
+/// prefix key for the same name must not abort the whole hydrate with EISDIR.
+pub(crate) fn should_skip_hydrate_path(local: &Path) -> bool {
+    local.is_dir()
+}
+
+/// True when `fs::write` failed because the path is a directory (EISDIR).
+/// Prefer raw_os_error 21 + message check — `ErrorKind::IsADirectory` needs rustc newer
+/// than our MSRV (1.71).
+fn is_eisdir_io_error(err: &std::io::Error) -> bool {
+    if err.raw_os_error() == Some(21) {
+        return true;
+    }
+    let msg = err.to_string().to_lowercase();
+    msg.contains("is a directory") || msg.contains("eisdir")
+}
+
 /// Resolve a remote key to a local path under `root`, rejecting escapes / internal keys.
-/// Returns Ok(None) when the key should be skipped (internal prefix).
+/// Returns Ok(None) when the key should be skipped (internal prefix or folder-marker key).
 pub fn resolve_pull_path(root: &Path, key: &str) -> Result<Option<PathBuf>> {
     if is_internal_r2_key(key) {
+        return Ok(None);
+    }
+    // S3/R2 "folder" markers are zero-byte keys ending in `/` — never download as files.
+    // Writing them would collide with real dirs created by nested object keys.
+    if key.ends_with('/') {
         return Ok(None);
     }
     if key.contains("..") || key.starts_with('/') || key.starts_with('\\') {
@@ -538,6 +561,16 @@ pub async fn hydrate_docs(client: &R2Client, cache_dir: &Path) -> Result<usize> 
             Some(p) => p,
             None => continue,
         };
+        // Bare prefix keys (e.g. `Business`) resolve to a path that is already a dir
+        // once nested docs created it — skip before size compare / get / write.
+        if should_skip_hydrate_path(&local) {
+            log::warn!(
+                "R2 hydrate: skipping key '{}' — local path is a directory ({})",
+                key,
+                local.display()
+            );
+            continue;
+        }
         let needs = if !local.exists() {
             true
         } else {
@@ -552,10 +585,39 @@ pub async fn hydrate_docs(client: &R2Client, cache_dir: &Path) -> Result<usize> 
         if let Some(parent) = local.parent() {
             fs::create_dir_all(parent).map_err(RagmcpError::Io)?;
         }
-        let bytes = client.get_object(&key).await?;
-        fs::write(&local, &bytes).map_err(RagmcpError::Io)?;
-        downloaded += 1;
-        log::debug!("R2 hydrate: wrote {} ({} bytes)", local.display(), bytes.len());
+        // One missing/failed object must not brick entire hydrate (ready stays false).
+        let bytes = match client.get_object(&key).await {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("R2 hydrate: get_object failed for '{}': {} — skipping", key, e);
+                continue;
+            }
+        };
+        // Guard again in case a concurrent mkdir raced between skip check and write.
+        if should_skip_hydrate_path(&local) {
+            log::warn!(
+                "R2 hydrate: skipping write for '{}' — path became a directory ({})",
+                key,
+                local.display()
+            );
+            continue;
+        }
+        match fs::write(&local, &bytes) {
+            Ok(()) => {
+                downloaded += 1;
+                log::debug!("R2 hydrate: wrote {} ({} bytes)", local.display(), bytes.len());
+            }
+            Err(e) if is_eisdir_io_error(&e) => {
+                // EISDIR: do not abort hydrate — leave ready path open for remaining keys.
+                log::warn!(
+                    "R2 hydrate: write EISDIR for '{}' at {} — skipping: {}",
+                    key,
+                    local.display(),
+                    e
+                );
+            }
+            Err(e) => return Err(RagmcpError::Io(e)),
+        }
     }
 
     // Idempotent refresh after successful hydrate — keeps end-of-path ownership explicit.
@@ -603,6 +665,12 @@ pub async fn pull_missing_to_folder(client: &R2Client, rag_folder: &Path) -> Res
                 continue;
             }
         };
+        // Directory collision (nested docs created the path) — same EISDIR class as hydrate.
+        if should_skip_hydrate_path(&local) {
+            println!("SKIP  {} (is directory)", key);
+            skipped += 1;
+            continue;
+        }
         if local.exists() {
             println!("SKIP  {} (exists)", key);
             skipped += 1;
@@ -617,10 +685,19 @@ pub async fn pull_missing_to_folder(client: &R2Client, rag_folder: &Path) -> Res
                         continue;
                     }
                 }
+                if should_skip_hydrate_path(&local) {
+                    println!("SKIP  {} (is directory)", key);
+                    skipped += 1;
+                    continue;
+                }
                 match fs::write(&local, &bytes) {
                     Ok(()) => {
                         println!("COPY  {} → {}", key, local.display());
                         copied += 1;
+                    }
+                    Err(e) if is_eisdir_io_error(&e) => {
+                        eprintln!("SKIP  {} (write EISDIR: {})", key, e);
+                        skipped += 1;
                     }
                     Err(e) => {
                         eprintln!("FAIL  {} (write: {})", key, e);
@@ -798,6 +875,42 @@ mod tests {
         assert!(resolve_pull_path(tmp.path(), "_ragmcp/ragmcp.db")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn test_pull_path_skips_trailing_slash_folder_marker() {
+        // R2/S3 zero-byte prefix keys like `Guides/` must not map to a writable file path.
+        let tmp = TempDir::new().unwrap();
+        assert!(resolve_pull_path(tmp.path(), "Guides/")
+            .unwrap()
+            .is_none());
+        assert!(resolve_pull_path(tmp.path(), "Business/")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn test_should_skip_hydrate_path_when_local_is_dir() {
+        // Documents the bare-prefix collision: nested `Business/doc.md` creates a dir;
+        // a later key `Business` must be skipped or fs::write aborts hydrate (EISDIR).
+        let tmp = TempDir::new().unwrap();
+        let business = tmp.path().join("Business");
+        fs::create_dir_all(&business).unwrap();
+        assert!(should_skip_hydrate_path(&business));
+        let file = tmp.path().join("readme.md");
+        fs::write(&file, b"hi").unwrap();
+        assert!(!should_skip_hydrate_path(&file));
+        assert!(!should_skip_hydrate_path(&tmp.path().join("missing.md")));
+    }
+
+    #[test]
+    fn test_is_eisdir_io_error_detects_os_21_and_message() {
+        let from_os = std::io::Error::from_raw_os_error(21);
+        assert!(is_eisdir_io_error(&from_os));
+        let from_msg = std::io::Error::new(std::io::ErrorKind::Other, "Is a directory (os error 21)");
+        assert!(is_eisdir_io_error(&from_msg));
+        let other = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        assert!(!is_eisdir_io_error(&other));
     }
 
     #[test]
