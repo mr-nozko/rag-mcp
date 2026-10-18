@@ -66,7 +66,11 @@ pub fn file_metadata_from_path(absolute_path: &Path, root: &Path) -> Result<Opti
 /// Check if the document at doc_path has the given hash in the database.
 /// Uses normalized path matching so `\` and `/` variants resolve.
 /// Returns `(file_hash, doc_id)` when a row exists.
-async fn get_stored_hash_and_id_for_path(db: &Db, doc_path: &str) -> Result<Option<(String, String)>> {
+/// `pub(crate)` so MCP reindex can share the same lookup without duplicating SQL.
+pub(crate) async fn get_stored_hash_and_id_for_path(
+    db: &Db,
+    doc_path: &str,
+) -> Result<Option<(String, String)>> {
     let doc_path = normalize_doc_path(doc_path);
     let out = db
         .with_connection(move |conn| {
@@ -83,6 +87,68 @@ async fn get_stored_hash_and_id_for_path(db: &Db, doc_path: &str) -> Result<Opti
         })
         .await?;
     Ok(out)
+}
+
+/// Outcome of hash-check + optional ingest + embed for one file.
+/// Shared by the file watcher and `ragmcp_reindex` so both paths stay identical.
+#[derive(Debug, Clone)]
+pub struct IndexFileStatus {
+    pub doc_id: String,
+    pub relative_path: String,
+    /// False when the on-disk SHA-256 already matched `documents.file_hash` (ingest skipped).
+    pub ingested: bool,
+    /// Chunk rows created by ingest; 0 when ingest was skipped.
+    pub chunks_created: usize,
+    /// Embeddings written for previously-NULL chunks (may be >0 even when ingest skipped).
+    pub embeddings_stored: usize,
+}
+
+/// Index a known file: skip re-ingest when hash matches, always backfill NULL embeddings.
+/// Callers with a resolved `FileMetadata` (watcher or MCP reindex) share this path.
+pub async fn index_file_with_status(
+    db: &Db,
+    config: &Config,
+    file: &FileMetadata,
+    parser_registry: &ParserRegistry,
+    embedder: &OpenAIEmbedder,
+) -> Result<IndexFileStatus> {
+    // Prefer DB doc_id when present so slash-variant upserts embed the correct rows
+    let current_hash = compute_file_hash(&file.absolute_path)?;
+    let stored = get_stored_hash_and_id_for_path(db, &file.relative_path).await?;
+    let hash_unchanged = stored
+        .as_ref()
+        .map(|(h, _)| h.as_str() == current_hash.as_str())
+        .unwrap_or(false);
+
+    if hash_unchanged {
+        let doc_id = stored
+            .as_ref()
+            .map(|(_, id)| id.clone())
+            .unwrap_or_else(|| format!("{:x}", Sha256::digest(file.relative_path.as_bytes())));
+        // Skip re-ingestion; still backfill any chunks that have NULL embedding for this doc
+        let stored_count =
+            embed_missing_for_doc(db, embedder, &doc_id, config.embeddings.batch_size).await?;
+        return Ok(IndexFileStatus {
+            doc_id,
+            relative_path: file.relative_path.clone(),
+            ingested: false,
+            chunks_created: 0,
+            embeddings_stored: stored_count,
+        });
+    }
+
+    // New or modified: re-ingest then embed using the upserted doc_id
+    let (doc_id, chunk_count, _tokens) =
+        ingest_file(db, file, parser_registry, config).await?;
+    let stored_count =
+        embed_missing_for_doc(db, embedder, &doc_id, config.embeddings.batch_size).await?;
+    Ok(IndexFileStatus {
+        doc_id,
+        relative_path: file.relative_path.clone(),
+        ingested: true,
+        chunks_created: chunk_count,
+        embeddings_stored: stored_count,
+    })
 }
 
 /// Embed all chunks for `doc_id` that still have NULL embeddings.
@@ -112,7 +178,7 @@ pub async fn embed_missing_for_doc(
 }
 
 /// Handle a single file change: hash check, ingest if changed, then embed chunks that have no embedding.
-/// When file hash is unchanged we skip re-ingestion but still backfill any chunks with NULL embeddings.
+/// Thin wrapper around [`index_file_with_status`] that keeps watcher log messages unchanged.
 pub async fn handle_file_change(
     db: &Db,
     config: &Config,
@@ -128,45 +194,26 @@ pub async fn handle_file_change(
         None => return Ok(()),
     };
 
-    // Prefer DB doc_id when present so slash-variant upserts embed the correct rows
-    let current_hash = compute_file_hash(&file.absolute_path)?;
-    let stored = get_stored_hash_and_id_for_path(db, &file.relative_path).await?;
-    let hash_unchanged = stored
-        .as_ref()
-        .map(|(h, _)| h.as_str() == current_hash.as_str())
-        .unwrap_or(false);
+    let status = index_file_with_status(db, config, &file, parser_registry, embedder).await?;
 
-    if hash_unchanged {
-        let doc_id = stored
-            .as_ref()
-            .map(|(_, id)| id.clone())
-            .unwrap_or_else(|| format!("{:x}", Sha256::digest(file.relative_path.as_bytes())));
-        // Skip re-ingestion; still backfill any chunks that have NULL embedding for this doc
-        let stored_count =
-            embed_missing_for_doc(db, embedder, &doc_id, config.embeddings.batch_size).await?;
-        if stored_count == 0 {
-            log::info!("watch: {} skip (unchanged, all embedded)", file.relative_path);
+    if !status.ingested {
+        if status.embeddings_stored == 0 {
+            log::info!("watch: {} skip (unchanged, all embedded)", status.relative_path);
             return Ok(());
         }
         log::info!(
             "watch: {} skip ingest, backfilled {} embeddings in {:?}",
-            file.relative_path,
-            stored_count,
+            status.relative_path,
+            status.embeddings_stored,
             start.elapsed()
         );
         return Ok(());
     }
 
-    // New or modified: re-ingest then embed using the upserted doc_id
-    let (doc_id, _chunk_count, _tokens) =
-        ingest_file(db, &file, parser_registry, config).await?;
-
-    let stored_count =
-        embed_missing_for_doc(db, embedder, &doc_id, config.embeddings.batch_size).await?;
-    if stored_count == 0 {
+    if status.embeddings_stored == 0 {
         log::info!(
             "watch: {} ingested, no new chunks to embed in {:?}",
-            file.relative_path,
+            status.relative_path,
             start.elapsed()
         );
         return Ok(());
@@ -174,8 +221,8 @@ pub async fn handle_file_change(
 
     log::info!(
         "watch: {} ingested, {} chunks embedded in {:?}",
-        file.relative_path,
-        stored_count,
+        status.relative_path,
+        status.embeddings_stored,
         start.elapsed()
     );
     Ok(())
@@ -343,5 +390,124 @@ mod tests {
 
         let meta = file_metadata_from_path(&file_path, root.path()).unwrap();
         assert!(meta.is_none());
+    }
+
+    /// Hash match + embeddings already present → ingested false, embeddings_stored 0 (no network).
+    #[tokio::test]
+    async fn test_index_file_with_status_unchanged_when_hash_matches() {
+        use crate::config::{
+            Config, EmbeddingsConfig, PerformanceConfig, RagmcpConfig, SearchConfig,
+        };
+        use crate::db::migrate;
+        use crate::embeddings::store_embeddings_batch;
+        use crate::ingest::chunker::Chunk;
+        use crate::ingest::db_writer::{insert_chunks, insert_document};
+        use crate::ingest::compute_file_hash;
+        use std::path::Path;
+
+        let temp_dir = TempDir::new().unwrap();
+        let rag = temp_dir.path().to_path_buf();
+        let sub = rag.join("agents");
+        fs::create_dir_all(&sub).unwrap();
+        let file_path = sub.join("unchanged.md");
+        let content = "# Unchanged doc\n\nBody text for hash match.\n";
+        fs::write(&file_path, content).unwrap();
+
+        let file_hash = compute_file_hash(&file_path).unwrap();
+        let relative_path = "agents/unchanged.md";
+
+        let db_path = rag.join("test.db");
+        let db = Db::new(&db_path);
+        let migrations_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        db.with_connection(move |conn| migrate::run_migrations(conn, &migrations_dir))
+            .await
+            .unwrap();
+
+        let doc_id = insert_document(
+            &db,
+            relative_path,
+            "markdown",
+            "agents",
+            None,
+            content,
+            10,
+            &file_hash,
+            std::time::SystemTime::now(),
+        )
+        .await
+        .unwrap();
+
+        let chunks = vec![Chunk {
+            text: "Body text for hash match.".to_string(),
+            tokens: 5,
+            section_header: Some("Unchanged doc".to_string()),
+            chunk_type: Some("markdown".to_string()),
+        }];
+        insert_chunks(&db, &doc_id, chunks).await.unwrap();
+
+        // Pre-fill embeddings so embed_missing finds nothing (no OpenAI call).
+        let without = get_chunks_without_embedding_for_doc(&db, &doc_id)
+            .await
+            .unwrap();
+        let dummy: Vec<f32> = (0..1536).map(|i| i as f32 * 0.001).collect();
+        let pairs: Vec<(String, Vec<f32>)> = without
+            .iter()
+            .map(|(id, _)| (id.clone(), dummy.clone()))
+            .collect();
+        store_embeddings_batch(&db, pairs).await.unwrap();
+
+        let config = Config {
+            ragmcp: RagmcpConfig {
+                rag_folder: rag.clone(),
+                db_path: db_path.clone(),
+                log_level: "info".to_string(),
+            },
+            embeddings: EmbeddingsConfig {
+                provider: "openai".to_string(),
+                model: "text-embedding-3-small".to_string(),
+                api_key_env: "OPENAI_API_KEY".to_string(),
+                batch_size: 100,
+                dimensions: 1536,
+                cache_capacity: 0,
+            },
+            search: SearchConfig {
+                default_k: 5,
+                min_score: 0.65,
+                hybrid_bm25_weight: 0.5,
+                hybrid_vector_weight: 0.5,
+            },
+            performance: PerformanceConfig {
+                max_latency_ms: 1000,
+                chunk_size_tokens: 300,
+                chunk_overlap_tokens: 50,
+            },
+            http_server: Default::default(),
+            pageindex: Default::default(),
+            storage: None,
+        };
+
+        let meta = fs::metadata(&file_path).unwrap();
+        let file = FileMetadata {
+            relative_path: relative_path.to_string(),
+            absolute_path: file_path,
+            extension: "md".to_string(),
+            file_size: meta.len(),
+            modified: meta.modified().unwrap(),
+        };
+
+        // Dummy key — must not hit the network when embeddings already exist.
+        let embedder = OpenAIEmbedder::new("dummy".into(), "text-embedding-3-small".into(), 10);
+        let registry = ParserRegistry::new();
+        let status = index_file_with_status(&db, &config, &file, &registry, &embedder)
+            .await
+            .unwrap();
+
+        assert!(!status.ingested, "hash match must skip ingest");
+        assert_eq!(status.chunks_created, 0);
+        assert_eq!(
+            status.embeddings_stored, 0,
+            "no NULL embeddings → zero stores, no network"
+        );
+        assert_eq!(status.doc_id, doc_id);
     }
 }

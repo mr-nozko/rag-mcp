@@ -5,7 +5,7 @@ pub mod chunker;
 pub mod db_writer;
 pub mod incremental;
 
-pub use walker::{FileMetadata, discover_files};
+pub use walker::{FileMetadata, discover_files, is_indexable_extension};
 pub use incremental::{
     FileClassification, DeleteDocumentsResult, classify_files, delete_documents,
     delete_documents_normalized, find_deleted_documents, get_existing_hashes,

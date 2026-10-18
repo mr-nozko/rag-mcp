@@ -23,6 +23,12 @@ use crate::ingest::{
 pub struct BootstrapStatus {
     /// True when at least one file was ingested or at least one embedding was stored.
     pub db_changed: bool,
+    /// Files successfully ingested in this pass.
+    pub ingested_ok: usize,
+    /// Per-file ingest failures (logged; does not abort the rest of the sweep).
+    pub ingest_errors: usize,
+    /// Chunk embeddings written for previously-NULL rows.
+    pub embeddings_stored: usize,
 }
 
 /// Run one incremental ingest pass + embed any chunks missing embeddings.
@@ -39,7 +45,12 @@ pub async fn bootstrap_index(
     if files.is_empty() {
         // Empty corpus is a no-op — callers may still upload an initial snapshot.
         log::warn!("R2 bootstrap: no documents found under {}", root.display());
-        return Ok(BootstrapStatus { db_changed: false });
+        return Ok(BootstrapStatus {
+            db_changed: false,
+            ingested_ok: 0,
+            ingest_errors: 0,
+            embeddings_stored: 0,
+        });
     }
 
     let existing_hashes = get_existing_hashes(db).await?;
@@ -53,17 +64,21 @@ pub async fn bootstrap_index(
 
     let registry = ParserRegistry::new();
     let mut ingested_ok = 0usize;
-    let mut err = 0usize;
+    let mut ingest_errors = 0usize;
     for file in &to_process {
         match ingest_file(db, file, &registry, config).await {
             Ok(_) => ingested_ok += 1,
             Err(e) => {
-                err += 1;
+                ingest_errors += 1;
                 log::error!("R2 bootstrap ingest failed for {}: {}", file.relative_path, e);
             }
         }
     }
-    log::info!("R2 bootstrap ingest: {} ok, {} errors", ingested_ok, err);
+    log::info!(
+        "R2 bootstrap ingest: {} ok, {} errors",
+        ingested_ok,
+        ingest_errors
+    );
 
     // Embed only chunks that still lack vectors (same query shape as embed CLI).
     let chunks = db
@@ -83,22 +98,28 @@ pub async fn bootstrap_index(
         log::info!("R2 bootstrap: all chunks already embedded");
         return Ok(BootstrapStatus {
             db_changed: ingested_ok > 0,
+            ingested_ok,
+            ingest_errors,
+            embeddings_stored: 0,
         });
     }
 
     let batch_size = config.embeddings.batch_size.max(1);
     log::info!("R2 bootstrap: embedding {} chunks (batch={})", chunks.len(), batch_size);
-    let mut embedded_count = 0usize;
+    let mut embeddings_stored = 0usize;
     for batch in chunks.chunks(batch_size) {
         let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
         let embeddings = embedder.embed_batch(texts).await?;
         for ((chunk_id, _), embedding) in batch.iter().zip(embeddings.into_iter()) {
             store_embedding(db, chunk_id, &embedding).await?;
-            embedded_count += 1;
+            embeddings_stored += 1;
         }
     }
 
     Ok(BootstrapStatus {
-        db_changed: ingested_ok > 0 || embedded_count > 0,
+        db_changed: ingested_ok > 0 || embeddings_stored > 0,
+        ingested_ok,
+        ingest_errors,
+        embeddings_stored,
     })
 }

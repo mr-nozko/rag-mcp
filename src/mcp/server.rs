@@ -337,6 +337,18 @@ impl McpServer {
                 )
                 .await?
             }
+            "ragmcp_reindex" => {
+                tools::handle_reindex(
+                    &self.db,
+                    &self.embedder,
+                    &self.config,
+                    self.chunk_cache.clone(),
+                    &params.arguments,
+                    self.pageindex.clone(),
+                    self.r2.clone(),
+                )
+                .await?
+            }
             "ragmcp_reason" => {
                 if let Some(pi) = &self.pageindex {
                     tools::handle_reason(

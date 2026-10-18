@@ -13,8 +13,11 @@ use crate::ingest::parsers::ParserRegistry;
 use crate::ingest::chunker::chunk_document;
 use crate::ingest::db_writer::{insert_chunks, insert_document};
 use crate::ingest::delete_documents_normalized;
-use crate::watch::embed_missing_for_doc;
-use crate::storage::R2Client;
+use crate::watch::{embed_missing_for_doc, index_file_with_status};
+use crate::ingest::{is_indexable_extension, FileMetadata};
+use crate::storage::{
+    bootstrap_index, hydrate_docs, is_internal_r2_key, R2Client,
+};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -294,6 +297,19 @@ pub fn get_tool_definitions(pageindex_enabled: bool) -> Vec<Tool> {
                     }
                 },
                 "required": ["doc_path"]
+            }),
+        },
+        Tool {
+            name: "ragmcp_reindex".to_string(),
+            description: "Re-index documents from R2 into the live search index without restarting. With doc_path: download that object and index it. Without doc_path: hydrate the bucket then run an incremental ingest+embed sweep.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "doc_path": {
+                        "type": "string",
+                        "description": "Optional relative path of one R2 object to download and index (e.g. \"Namespace/sub/doc.md\"). Omit or leave blank to reconcile the entire bucket."
+                    }
+                }
             }),
         },
     ];
@@ -1322,6 +1338,296 @@ struct DeleteDocParams {
     doc_path: String,
 }
 
+/// Params for ragmcp_reindex — `doc_path` omitted/blank means full-bucket sweep.
+#[derive(Debug, Deserialize)]
+struct ReindexParams {
+    #[serde(default)]
+    doc_path: Option<String>,
+}
+
+/// Re-index from R2: one object when `doc_path` is set, or hydrate + bootstrap when omitted.
+/// Requires an R2 client (`r2 == None` → error). Never `put_document`s; only uploads the SQLite snapshot when the DB changed.
+pub async fn handle_reindex(
+    db: &Db,
+    embedder: &OpenAIEmbedder,
+    config: &Config,
+    cache: Option<Arc<ChunkEmbeddingCache>>,
+    arguments: &Value,
+    pageindex: Option<Arc<crate::pageindex::PageIndexManager>>,
+    r2: Option<Arc<R2Client>>,
+) -> Result<ToolsCallResult> {
+    let params: ReindexParams = serde_json::from_value(arguments.clone())
+        .map_err(|e| RagmcpError::InvalidInput(format!("Invalid parameters: {}", e)))?;
+
+    // Blank / whitespace-only after normalize → bucket mode (same as missing).
+    let doc_path_opt = params
+        .doc_path
+        .as_deref()
+        .map(|s| normalize_doc_path(s.trim()))
+        .filter(|s| !s.is_empty());
+
+    if let Some(doc_path) = doc_path_opt {
+        return handle_reindex_document(
+            db, embedder, config, cache, pageindex, r2, doc_path,
+        )
+        .await;
+    }
+
+    handle_reindex_bucket(db, embedder, config, cache, r2).await
+}
+
+/// Document mode: validate path before requiring R2, then GET → write → shared index → snapshot.
+async fn handle_reindex_document(
+    db: &Db,
+    embedder: &OpenAIEmbedder,
+    config: &Config,
+    cache: Option<Arc<ChunkEmbeddingCache>>,
+    pageindex: Option<Arc<crate::pageindex::PageIndexManager>>,
+    r2: Option<Arc<R2Client>>,
+    doc_path: String,
+) -> Result<ToolsCallResult> {
+    // Reject internal snapshot keys and path escapes before any network call.
+    if is_internal_r2_key(&doc_path) {
+        return Err(RagmcpError::InvalidInput(format!(
+            "Cannot reindex internal R2 key: {}",
+            doc_path
+        )));
+    }
+
+    let validator = PathValidator::new(&config.ragmcp.rag_folder)?;
+    let absolute_path = validator.validate_write_path(&doc_path)?;
+
+    let extension = Path::new(&doc_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if !is_indexable_extension(&extension) {
+        return Err(RagmcpError::InvalidInput(format!(
+            "Unsupported extension for reindex: '{}'",
+            if extension.is_empty() { "(none)" } else { &extension }
+        )));
+    }
+
+    // Path validation done — R2 is required for the download.
+    let client = r2.as_ref().ok_or_else(|| {
+        RagmcpError::InvalidInput(
+            "ragmcp_reindex requires R2 storage mode (no [storage] backend=r2 configured)"
+                .to_string(),
+        )
+    })?;
+
+    // Bucket is source of truth: always download, then overwrite local cache file.
+    let bytes = client.get_object(&doc_path).await?;
+    if let Some(parent) = absolute_path.parent() {
+        fs::create_dir_all(parent).map_err(RagmcpError::Io)?;
+    }
+    fs::write(&absolute_path, &bytes).map_err(RagmcpError::Io)?;
+
+    let metadata = fs::metadata(&absolute_path).map_err(RagmcpError::Io)?;
+    let file = FileMetadata {
+        relative_path: doc_path.clone(),
+        absolute_path: absolute_path.clone(),
+        extension,
+        file_size: metadata.len(),
+        modified: metadata.modified().map_err(RagmcpError::Io)?,
+    };
+
+    // ParserRegistry is !Send — build/drop inside the shared index call site.
+    let status = {
+        let registry = ParserRegistry::new();
+        index_file_with_status(db, config, &file, &registry, embedder).await?
+    };
+
+    let db_changed = status.ingested || status.embeddings_stored > 0;
+    let mut snapshot_ok = true;
+    let mut operation_id = String::new();
+
+    if db_changed {
+        if let Some(ref cache) = cache {
+            cache.clear();
+        }
+        // Object already in the bucket — upload SQLite snapshot only (not put_document).
+        match client.upload_snapshot(config.db_path()).await {
+            Ok(()) => snapshot_ok = true,
+            Err(e) => {
+                log::error!("R2 snapshot upload after reindex failed: {}", e);
+                snapshot_ok = false;
+            }
+        }
+
+        let meta_json = json!({
+            "mode": "document",
+            "ingested": status.ingested,
+            "chunks_created": status.chunks_created,
+            "embeddings_stored": status.embeddings_stored
+        })
+        .to_string();
+        operation_id = log_operation(
+            db,
+            "reindex",
+            &doc_path,
+            Some(&status.doc_id),
+            true,
+            None,
+            Some(&meta_json),
+        )
+        .await?;
+
+        // PageIndex only on content change (ingest), same spawn as create_doc.
+        if status.ingested {
+            if let Some(pi) = pageindex {
+                let pi_clone = pi.clone();
+                let path_clone = doc_path.clone();
+                let doc_id_clone = status.doc_id.clone();
+                let db_path = config.db_path().to_path_buf();
+                let model_clone = config.pageindex.default_model.clone();
+                let r2_for_pi = r2.clone();
+                tokio::spawn(async move {
+                    let db = crate::db::Db::new(&db_path);
+                    if let Ok(resp) = pi_clone.index_document(&path_clone, &model_clone).await {
+                        let node_count = resp.node_count.unwrap_or(0);
+                        let tree_path = resp.tree_path;
+                        let insert_ok = db.with_connection(move |conn| {
+                            conn.execute(
+                                "INSERT OR REPLACE INTO pageindex_index (doc_id, doc_path, tree_path, tree_built_at, tree_node_count, model_used) VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, ?)",
+                                rusqlite::params![doc_id_clone, path_clone, tree_path, node_count, model_clone]
+                            )?;
+                            Ok::<_, RagmcpError>(())
+                        }).await;
+                        if insert_ok.is_ok() {
+                            if let Some(client) = r2_for_pi {
+                                if let Err(e) = client.upload_snapshot(&db_path).await {
+                                    log::error!(
+                                        "R2 snapshot upload after pageindex (reindex) failed: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    let status_label = if db_changed { "indexed" } else { "unchanged" };
+    let r2_snapshot_failed = db_changed && !snapshot_ok;
+    let message = if r2_snapshot_failed {
+        "Document reindexed in live index, but R2 snapshot upload failed"
+    } else if db_changed {
+        "Document reindexed successfully"
+    } else {
+        "Document unchanged (hash matched, embeddings present)"
+    };
+
+    let text = json!({
+        "success": true,
+        "mode": "document",
+        "doc_path": doc_path,
+        "doc_id": status.doc_id,
+        "status": status_label,
+        "chunks_created": status.chunks_created,
+        "embeddings_stored": status.embeddings_stored,
+        "operation_id": if operation_id.is_empty() { Value::Null } else { json!(operation_id) },
+        "r2_snapshot_ok": if db_changed { snapshot_ok } else { true },
+        "message": message
+    })
+    .to_string();
+
+    Ok(ToolsCallResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text,
+        }],
+        is_error: if r2_snapshot_failed { Some(true) } else { None },
+    })
+}
+
+/// Bucket mode: hydrate all non-internal objects, then incremental bootstrap_index.
+async fn handle_reindex_bucket(
+    db: &Db,
+    embedder: &OpenAIEmbedder,
+    config: &Config,
+    cache: Option<Arc<ChunkEmbeddingCache>>,
+    r2: Option<Arc<R2Client>>,
+) -> Result<ToolsCallResult> {
+    let client = r2.as_ref().ok_or_else(|| {
+        RagmcpError::InvalidInput(
+            "ragmcp_reindex requires R2 storage mode (no [storage] backend=r2 configured)"
+                .to_string(),
+        )
+    })?;
+
+    // Err from hydrate/bootstrap fails the tool; per-file ingest errors stay inside bootstrap.
+    let downloaded = hydrate_docs(client, config.rag_folder()).await?;
+    let status = bootstrap_index(db, config, embedder).await?;
+
+    let mut snapshot_ok = true;
+    if status.db_changed {
+        if let Some(ref cache) = cache {
+            cache.clear();
+        }
+        match client.upload_snapshot(config.db_path()).await {
+            Ok(()) => snapshot_ok = true,
+            Err(e) => {
+                log::error!("R2 snapshot upload after bucket reindex failed: {}", e);
+                snapshot_ok = false;
+            }
+        }
+    }
+
+    let meta_json = json!({
+        "mode": "bucket",
+        "downloaded": downloaded,
+        "ingested": status.ingested_ok,
+        "ingest_errors": status.ingest_errors,
+        "embeddings_stored": status.embeddings_stored,
+        "db_changed": status.db_changed
+    })
+    .to_string();
+    let _operation_id = log_operation(
+        db,
+        "reindex",
+        "(bucket)",
+        None,
+        true,
+        None,
+        Some(&meta_json),
+    )
+    .await?;
+
+    let r2_snapshot_failed = status.db_changed && !snapshot_ok;
+    let message = if r2_snapshot_failed {
+        "Bucket reindex completed in live index, but R2 snapshot upload failed"
+    } else if status.db_changed {
+        "Bucket reindex completed successfully"
+    } else {
+        "Bucket reindex: no database changes"
+    };
+
+    let text = json!({
+        "success": true,
+        "mode": "bucket",
+        "downloaded": downloaded,
+        "ingested": status.ingested_ok,
+        "ingest_errors": status.ingest_errors,
+        "embeddings_stored": status.embeddings_stored,
+        "db_changed": status.db_changed,
+        "r2_snapshot_ok": if status.db_changed { snapshot_ok } else { true },
+        "message": message
+    })
+    .to_string();
+
+    Ok(ToolsCallResult {
+        content: vec![ContentItem {
+            content_type: "text".to_string(),
+            text,
+        }],
+        is_error: if r2_snapshot_failed { Some(true) } else { None },
+    })
+}
+
 /// Delete a document file under rag_folder and remove it from the SQLite index.
 pub async fn handle_delete_doc(
     db: &Db,
@@ -1662,6 +1968,111 @@ mod tests {
             tools.iter().any(|t| t.name == "ragmcp_delete_doc"),
             "ragmcp_delete_doc must appear in tools/list"
         );
+    }
+
+    #[test]
+    fn test_reindex_listed_and_doc_path_not_required() {
+        let tools = get_tool_definitions(false);
+        let reindex = tools
+            .iter()
+            .find(|t| t.name == "ragmcp_reindex")
+            .expect("ragmcp_reindex must appear in tools/list");
+        let required = reindex.input_schema.get("required");
+        // Optional doc_path: schema must not list it as required (absent or empty array).
+        match required {
+            None => {}
+            Some(Value::Array(arr)) => {
+                assert!(
+                    !arr.iter().any(|v| v.as_str() == Some("doc_path")),
+                    "doc_path must not be required on ragmcp_reindex"
+                );
+            }
+            other => panic!("unexpected required schema: {:?}", other),
+        }
+        assert!(
+            reindex
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.get("doc_path"))
+                .is_some(),
+            "doc_path property must be present (optional)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reindex_rejects_traversal_without_r2() {
+        let (db, config, _temp) = setup_delete_test().await;
+        let embedder = OpenAIEmbedder::new("dummy".into(), "text-embedding-3-small".into(), 10);
+        let args = json!({ "doc_path": "../outside.md" });
+        let err = handle_reindex(&db, &embedder, &config, None, &args, None, None)
+            .await
+            .unwrap_err();
+        match err {
+            RagmcpError::InvalidInput(msg) => {
+                assert!(msg.contains("traversal") || msg.contains(".."));
+            }
+            other => panic!("expected InvalidInput, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reindex_rejects_internal_key_without_r2() {
+        let (db, config, _temp) = setup_delete_test().await;
+        let embedder = OpenAIEmbedder::new("dummy".into(), "text-embedding-3-small".into(), 10);
+        let args = json!({ "doc_path": "_ragmcp/ragmcp.db" });
+        let err = handle_reindex(&db, &embedder, &config, None, &args, None, None)
+            .await
+            .unwrap_err();
+        match err {
+            RagmcpError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("internal") || msg.contains("_ragmcp"),
+                    "unexpected message: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidInput, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reindex_rejects_unsupported_extension_without_r2() {
+        let (db, config, _temp) = setup_delete_test().await;
+        let embedder = OpenAIEmbedder::new("dummy".into(), "text-embedding-3-small".into(), 10);
+        let args = json!({ "doc_path": "Guides/photo.png" });
+        let err = handle_reindex(&db, &embedder, &config, None, &args, None, None)
+            .await
+            .unwrap_err();
+        match err {
+            RagmcpError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("Unsupported extension") || msg.contains("png"),
+                    "unexpected message: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidInput, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_reindex_requires_r2_on_valid_path() {
+        let (db, config, _temp) = setup_delete_test().await;
+        let embedder = OpenAIEmbedder::new("dummy".into(), "text-embedding-3-small".into(), 10);
+        let args = json!({ "doc_path": "Guides/note.md" });
+        let err = handle_reindex(&db, &embedder, &config, None, &args, None, None)
+            .await
+            .unwrap_err();
+        match err {
+            RagmcpError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("R2") || msg.contains("storage"),
+                    "unexpected message: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidInput for missing R2, got {:?}", other),
+        }
     }
 
     fn test_config(rag_folder: &Path) -> Config {

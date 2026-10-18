@@ -1,6 +1,6 @@
 //! Document write operations audit logging (Module 14).
 //!
-//! `operation_type` values: `create` | `update` | `delete`
+//! `operation_type` values: `create` | `update` | `delete` | `reindex`
 
 use crate::db::Db;
 use crate::error::Result;

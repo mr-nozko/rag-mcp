@@ -12,6 +12,20 @@ pub struct FileMetadata {
     pub modified: std::time::SystemTime,
 }
 
+/// True when `ext` (lowercase, no leading dot) is an indexable document type.
+/// Shared by `discover_files` and MCP `ragmcp_reindex` so the allow-list stays one place.
+pub fn is_indexable_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        // Documentation / markup
+        "md" | "txt" | "xml" |
+        // Data / configuration
+        "yaml" | "yml" | "json" | "toml" |
+        // Source code (optional — useful for code-knowledge RAG)
+        "rs" | "py" | "ts" | "js" | "go"
+    )
+}
+
 /// Discover all relevant files in the configured rag_folder (docs root directory).
 ///
 /// Recursively walks the entire directory tree and indexes all common text-based
@@ -42,16 +56,7 @@ pub fn discover_files(root: &Path) -> Result<Vec<FileMetadata>> {
             .to_lowercase();
         
         // Filter for relevant text-based file types; binary files are skipped.
-        // Add more extensions here if you want to index additional file types.
-        if !matches!(
-            extension.as_str(),
-            // Documentation / markup
-            "md" | "txt" | "xml" |
-            // Data / configuration
-            "yaml" | "yml" | "json" | "toml" |
-            // Source code (optional — useful for code-knowledge RAG)
-            "rs" | "py" | "ts" | "js" | "go"
-        ) {
+        if !is_indexable_extension(&extension) {
             continue;
         }
         
@@ -121,5 +126,14 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let files = discover_files(temp_dir.path()).unwrap();
         assert_eq!(files.len(), 0);
+    }
+
+    #[test]
+    fn test_is_indexable_extension() {
+        assert!(is_indexable_extension("md"));
+        assert!(is_indexable_extension("toml"));
+        assert!(is_indexable_extension("rs"));
+        assert!(!is_indexable_extension("png"));
+        assert!(!is_indexable_extension(""));
     }
 }
