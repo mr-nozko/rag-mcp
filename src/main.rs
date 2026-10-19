@@ -124,7 +124,8 @@ async fn r2_restore_and_ready(
     log::info!("R2 restore: hydrating documents into {}", cache_dir.display());
     // Fail closed: do not bootstrap, upload snapshot, set ready, or start watcher on hydrate Err.
     // Mid-hydrate now writes the cache marker early so a later retry is not latched.
-    if let Err(e) = hydrate_docs(&r2, &cache_dir).await {
+    // Pass db so manifest can skip re-downloading unchanged objects (bandwidth win on wake).
+    if let Err(e) = hydrate_docs(&r2, &cache_dir, Some(&db)).await {
         log::error!("R2 hydrate failed — leaving ready=false (no bootstrap/snapshot/watcher): {}", e);
         return;
     }
@@ -157,6 +158,9 @@ async fn r2_restore_and_ready(
     }
 
     let _ = log_db_stats(&db).await;
+
+    // Bandwidth accounting after restore (includes snapshot + filtered hydrate GETs).
+    r2.counters().log("r2_restore_and_ready");
 
     // Mark ready BEFORE watcher so /wake and MCP open as soon as index is usable.
     ready.store(true, Ordering::SeqCst);
