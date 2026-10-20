@@ -16,7 +16,8 @@ use crate::ingest::delete_documents_normalized;
 use crate::watch::{embed_missing_for_doc, index_file_with_status};
 use crate::ingest::{is_indexable_extension, FileMetadata};
 use crate::storage::{
-    bootstrap_index, hydrate_docs, is_internal_r2_key, R2Client,
+    bootstrap_index, delete_manifest_entry, hydrate_docs, is_internal_r2_key,
+    normalize_etag, schedule_snapshot_upload, upsert_manifest_entry, R2Client,
 };
 use std::fs;
 use std::path::Path;
@@ -26,25 +27,21 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-/// After a successful local write, mirror the object to R2 and upload a SQLite snapshot.
-/// Returns whether the snapshot upload succeeded (`true` when R2 is None / local mode).
+/// After a successful local write, mirror the object to R2 and schedule a coalesced snapshot.
+/// Returns `true` when the object was mirrored and snapshot was scheduled (`true` in local mode).
+/// `r2_snapshot_ok` means object mirrored + snapshot *scheduled* (not that PUT finished).
 /// Search/get/watcher never call this — only create/update/delete write-through.
 async fn r2_write_through_put(
     r2: &Option<Arc<R2Client>>,
+    db: &Db,
     db_path: &Path,
     relative_path: &str,
     absolute_path: &Path,
 ) -> bool {
     // Local mode: no remote snapshot to fail — treat as success so callers stay green.
     let Some(client) = r2 else { return true };
-    match fs::read(absolute_path) {
-        Ok(bytes) => {
-            if let Err(e) = client.put_document(relative_path, &bytes).await {
-                log::error!("R2 write-through put failed for {}: {}", relative_path, e);
-                // Object not mirrored — report snapshot as failed (not attempted).
-                return false;
-            }
-        }
+    let bytes = match fs::read(absolute_path) {
+        Ok(b) => b,
         Err(e) => {
             log::error!(
                 "R2 write-through: cannot read {} for upload: {}",
@@ -53,21 +50,39 @@ async fn r2_write_through_put(
             );
             return false;
         }
-    }
-    match client.upload_snapshot(db_path).await {
-        Ok(()) => true,
+    };
+    let etag = match client.put_document(relative_path, &bytes).await {
+        Ok(etag) => etag,
         Err(e) => {
-            log::error!("R2 snapshot upload after put failed: {}", e);
-            false
+            log::error!("R2 write-through put failed for {}: {}", relative_path, e);
+            // Object not mirrored — do not schedule snapshot.
+            return false;
         }
+    };
+    // Fill manifest so the next hydrate can skip this key even if /tmp is wiped.
+    let size = bytes.len() as u64;
+    let etag_n = etag
+        .as_deref()
+        .map(normalize_etag)
+        .unwrap_or_default();
+    if let Err(e) = upsert_manifest_entry(db, relative_path, size, &etag_n).await {
+        log::warn!(
+            "R2 write-through: manifest upsert failed for {}: {}",
+            relative_path,
+            e
+        );
     }
+    // Debounce snapshot — do not block the tool for ~10s.
+    schedule_snapshot_upload(Arc::clone(client), db_path.to_path_buf());
+    true
 }
 
-/// After a successful local delete, remove the R2 object and upload a SQLite snapshot.
-/// Retries object delete once; on object failure logs but always attempts snapshot.
-/// Returns whether the snapshot upload succeeded (`true` when R2 is None / local mode).
+/// After a successful local delete, remove the R2 object, drop manifest row, schedule snapshot.
+/// Retries object delete once; on object failure logs but still schedules snapshot.
+/// Returns `true` when snapshot was scheduled (`true` in local mode).
 async fn r2_write_through_delete(
     r2: &Option<Arc<R2Client>>,
+    db: &Db,
     db_path: &Path,
     relative_path: &str,
 ) -> bool {
@@ -80,7 +95,7 @@ async fn r2_write_through_delete(
             e
         );
         if let Err(e2) = client.delete_document(relative_path).await {
-            // Do not return early — snapshot must still be attempted so remote DB stays current.
+            // Do not return early — snapshot must still be scheduled so remote DB stays current.
             log::error!(
                 "R2 write-through delete retry failed for {}: {}",
                 relative_path,
@@ -88,13 +103,16 @@ async fn r2_write_through_delete(
             );
         }
     }
-    match client.upload_snapshot(db_path).await {
-        Ok(()) => true,
-        Err(e) => {
-            log::error!("R2 snapshot upload after delete failed: {}", e);
-            false
-        }
+    // Drop manifest row so a later hydrate does not skip a deleted key.
+    if let Err(e) = delete_manifest_entry(db, relative_path).await {
+        log::warn!(
+            "R2 write-through: manifest delete failed for {}: {}",
+            relative_path,
+            e
+        );
     }
+    schedule_snapshot_upload(Arc::clone(client), db_path.to_path_buf());
+    true
 }
 
 /// Get all tool definitions for tools/list
@@ -1089,21 +1107,20 @@ pub async fn handle_create_doc(
                     )?;
                     Ok::<_, RagmcpError>(())
                 }).await;
-                // After pageindex_index is durable, push a fresh snapshot when R2 is configured.
+                // After pageindex_index is durable, schedule a coalesced snapshot (not immediate).
                 if insert_ok.is_ok() {
                     if let Some(client) = r2_for_pi {
-                        if let Err(e) = client.upload_snapshot(&db_path).await {
-                            log::error!("R2 snapshot upload after pageindex (create) failed: {}", e);
-                        }
+                        schedule_snapshot_upload(client, db_path);
                     }
                 }
             }
         });
     }
 
-    // R2 write-through: object + snapshot (no-op when r2 is None / local mode)
-    let snapshot_ok = r2_write_through_put(&r2, config.db_path(), &doc_path, &absolute_path).await;
-    // Live index succeeded; surface R2 snapshot failure so the client can retry/alert.
+    // R2 write-through: object + scheduled snapshot (no-op when r2 is None / local mode)
+    let snapshot_ok =
+        r2_write_through_put(&r2, db, config.db_path(), &doc_path, &absolute_path).await;
+    // Live index succeeded; surface R2 object-mirror failure so the client can retry/alert.
     let r2_snapshot_failed = r2.is_some() && !snapshot_ok;
     let text = if r2_snapshot_failed {
         json!({
@@ -1114,7 +1131,7 @@ pub async fn handle_create_doc(
             "embeddings_stored": embedded,
             "operation_id": operation_id,
             "r2_snapshot_ok": false,
-            "message": "Document created in live index, but R2 snapshot upload failed"
+            "message": "Document created in live index, but R2 object mirror failed"
         })
         .to_string()
     } else {
@@ -1125,6 +1142,7 @@ pub async fn handle_create_doc(
             "chunks_created": chunk_count,
             "embeddings_stored": embedded,
             "operation_id": operation_id,
+            "r2_snapshot_ok": true,
             "message": "Document created successfully"
         })
         .to_string()
@@ -1171,11 +1189,31 @@ pub async fn handle_update_doc(
     let validator = PathValidator::new(&config.ragmcp.rag_folder)?;
     let absolute_path = validator.validate_write_path(&doc_path)?;
 
-    // Read existing content
+    // Read existing content; if ephemeral disk lost the file, lazy-fetch from R2 first.
     let mut current_content = if absolute_path.exists() {
         fs::read_to_string(&absolute_path).unwrap_or_default()
+    } else if let Some(ref client) = r2 {
+        // Bandwidth: one GET only when local cache miss and caller needs the body to edit.
+        match client.get_object(&doc_path).await {
+            Ok(bytes) => {
+                if let Some(parent) = absolute_path.parent() {
+                    fs::create_dir_all(parent).map_err(RagmcpError::Io)?;
+                }
+                fs::write(&absolute_path, &bytes).map_err(RagmcpError::Io)?;
+                String::from_utf8_lossy(&bytes).into_owned()
+            }
+            Err(e) => {
+                return Err(RagmcpError::InvalidInput(format!(
+                    "Cannot apply updates: File does not exist at {} (R2 fetch failed: {})",
+                    doc_path, e
+                )));
+            }
+        }
     } else {
-        return Err(RagmcpError::InvalidInput(format!("Cannot apply updates: File does not exist at {}", doc_path)));
+        return Err(RagmcpError::InvalidInput(format!(
+            "Cannot apply updates: File does not exist at {}",
+            doc_path
+        )));
     };
 
     for update in &params.updates {
@@ -1282,21 +1320,20 @@ pub async fn handle_update_doc(
                     )?;
                     Ok::<_, RagmcpError>(())
                 }).await;
-                // After pageindex_index is durable, push a fresh snapshot when R2 is configured.
+                // After pageindex_index is durable, schedule a coalesced snapshot (not immediate).
                 if insert_ok.is_ok() {
                     if let Some(client) = r2_for_pi {
-                        if let Err(e) = client.upload_snapshot(&db_path).await {
-                            log::error!("R2 snapshot upload after pageindex (update) failed: {}", e);
-                        }
+                        schedule_snapshot_upload(client, db_path);
                     }
                 }
             }
         });
     }
 
-    // R2 write-through: object + snapshot (no-op when r2 is None / local mode)
-    let snapshot_ok = r2_write_through_put(&r2, config.db_path(), &doc_path, &absolute_path).await;
-    // Live index succeeded; surface R2 snapshot failure so the client can retry/alert.
+    // R2 write-through: object + scheduled snapshot (no-op when r2 is None / local mode)
+    let snapshot_ok =
+        r2_write_through_put(&r2, db, config.db_path(), &doc_path, &absolute_path).await;
+    // Live index succeeded; surface R2 object-mirror failure so the client can retry/alert.
     let r2_snapshot_failed = r2.is_some() && !snapshot_ok;
     let text = if r2_snapshot_failed {
         json!({
@@ -1307,7 +1344,7 @@ pub async fn handle_update_doc(
             "embeddings_stored": embedded,
             "operation_id": operation_id,
             "r2_snapshot_ok": false,
-            "message": "Document updated in live index, but R2 snapshot upload failed"
+            "message": "Document updated in live index, but R2 object mirror failed"
         })
         .to_string()
     } else {
@@ -1318,6 +1355,7 @@ pub async fn handle_update_doc(
             "chunks_created": chunk_count,
             "embeddings_stored": embedded,
             "operation_id": operation_id,
+            "r2_snapshot_ok": true,
             "message": "Document updated successfully"
         })
         .to_string()
@@ -1497,12 +1535,8 @@ async fn handle_reindex_document(
                         }).await;
                         if insert_ok.is_ok() {
                             if let Some(client) = r2_for_pi {
-                                if let Err(e) = client.upload_snapshot(&db_path).await {
-                                    log::error!(
-                                        "R2 snapshot upload after pageindex (reindex) failed: {}",
-                                        e
-                                    );
-                                }
+                                // PageIndex metadata change — coalesce with other write-throughs.
+                                schedule_snapshot_upload(client, db_path);
                             }
                         }
                     }
@@ -1560,7 +1594,8 @@ async fn handle_reindex_bucket(
     })?;
 
     // Err from hydrate/bootstrap fails the tool; per-file ingest errors stay inside bootstrap.
-    let downloaded = hydrate_docs(client, config.rag_folder()).await?;
+    // Pass db for manifest-filtered hydrate (skip unchanged objects).
+    let downloaded = hydrate_docs(client, config.rag_folder(), Some(db)).await?;
     let status = bootstrap_index(db, config, embedder).await?;
 
     let mut snapshot_ok = true;
@@ -1704,9 +1739,9 @@ pub async fn handle_delete_doc(
     )
     .await?;
 
-    // R2 write-through: delete object + snapshot (no-op when r2 is None / local mode)
-    let snapshot_ok = r2_write_through_delete(&r2, config.db_path(), &doc_path).await;
-    // Live index succeeded; surface R2 snapshot failure so the client can retry/alert.
+    // R2 write-through: delete object + scheduled snapshot (no-op when r2 is None / local mode)
+    let snapshot_ok = r2_write_through_delete(&r2, db, config.db_path(), &doc_path).await;
+    // Live index succeeded; surface R2 failure so the client can retry/alert.
     let r2_snapshot_failed = r2.is_some() && !snapshot_ok;
     let text = if r2_snapshot_failed {
         json!({
@@ -1717,7 +1752,7 @@ pub async fn handle_delete_doc(
             "deleted_from_index": deleted_from_index,
             "operation_id": operation_id,
             "r2_snapshot_ok": false,
-            "message": "Document deleted from live index, but R2 snapshot upload failed"
+            "message": "Document deleted from live index, but R2 write-through failed"
         })
         .to_string()
     } else {
@@ -1727,6 +1762,7 @@ pub async fn handle_delete_doc(
             "doc_id": index_result.doc_id,
             "deleted_from_disk": deleted_from_disk,
             "deleted_from_index": deleted_from_index,
+            "r2_snapshot_ok": true,
             "operation_id": operation_id,
             "message": "Document deleted successfully"
         })

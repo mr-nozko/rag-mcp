@@ -6,8 +6,9 @@
 pub mod r2;
 
 pub use r2::{
-    assert_cache_dir_safe, hydrate_docs, is_internal_r2_key, pull_missing_to_folder,
-    R2Client, CACHE_MARKER_NAME, DEFAULT_SNAPSHOT_KEY, INTERNAL_PREFIX,
+    assert_cache_dir_safe, delete_manifest_entry, hydrate_docs, is_internal_r2_key,
+    normalize_etag, pull_missing_to_folder, schedule_snapshot_upload, upsert_manifest_entry,
+    R2Client, CACHE_MARKER_NAME, DEFAULT_SNAPSHOT_KEY, INTERNAL_PREFIX, SNAPSHOT_DEBOUNCE_SECS,
 };
 
 use crate::config::Config;
