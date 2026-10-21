@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 
 /// Build FileMetadata from an absolute path and the qm_os root.
 /// Returns None if the path is outside root or has an unsupported extension.
-const ALLOWED_EXTENSIONS: &[&str] = &["xml", "yaml", "yml", "json", "md", "txt"];
+const ALLOWED_EXTENSIONS: &[&str] = &["xml", "yaml", "yml", "json", "md", "txt", "csv"];
 
 pub fn file_metadata_from_path(absolute_path: &Path, root: &Path) -> Result<Option<FileMetadata>> {
     let root = root

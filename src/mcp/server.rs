@@ -266,21 +266,40 @@ impl McpServer {
         })
     }
 
-    /// Handle tools/call request
+    /// Handle tools/call request.
+    ///
+    /// Every call is traced with `log` (env_logger on stderr, `RUST_LOG` default
+    /// `info`, initialized in `main`). Stdio MCP reserves stdout for JSON-RPC, so
+    /// these lines must not use `println!`.
     async fn handle_tools_call(
         &self,
         id: &JsonRpcId,
         params: &Option<Value>,
     ) -> Result<JsonRpcResponse> {
+        // Parse failures have no tool name yet. Log them here: process_mcp_request
+        // turns this Err into a JSON-RPC error and does not log it itself.
         let params: ToolsCallParams = serde_json::from_value(
             params.clone().ok_or_else(|| {
                 RagmcpError::Config("Missing params for tools/call".to_string())
             })?
         )
-        .map_err(|e| RagmcpError::Config(format!("Invalid tools/call params: {}", e)))?;
+        .map_err(|e| {
+            let message = format!("Invalid tools/call params: {}", e);
+            log::error!("tool call failed: {}", message);
+            RagmcpError::Config(message)
+        })?;
 
-        // Route to appropriate tool handler
-        let result = match params.name.as_str() {
+        // Name plus arguments, before routing, so unknown tools are visible too.
+        // Success payloads are never logged — only this request line and the outcome.
+        log::info!(
+            "tool call {} arguments: {}",
+            params.name,
+            format_tool_args(&params.arguments)
+        );
+
+        // Collect the handler Result instead of `?` so a failure can be logged
+        // here and still returned for process_mcp_request to wrap as internal error.
+        let outcome = match params.name.as_str() {
             "ragmcp_search" => {
                 tools::handle_search(
                     &self.db,
@@ -289,19 +308,19 @@ impl McpServer {
                     &params.arguments,
                     self.chunk_cache.clone(),
                 )
-                .await?
+                .await
             }
             "ragmcp_get" => {
-                tools::handle_get(&self.db, &self.config, &params.arguments).await?
+                tools::handle_get(&self.db, &self.config, &params.arguments).await
             }
             "ragmcp_list" => {
-                tools::handle_list(&self.db, &params.arguments).await?
+                tools::handle_list(&self.db, &params.arguments).await
             }
             "ragmcp_related" => {
-                tools::handle_related(&self.db, &params.arguments).await?
+                tools::handle_related(&self.db, &params.arguments).await
             }
             "ragmcp_explain" => {
-                tools::handle_explain(&self.db, &params.arguments).await?
+                tools::handle_explain(&self.db, &params.arguments).await
             }
             "ragmcp_create_doc" => {
                 tools::handle_create_doc(
@@ -313,7 +332,7 @@ impl McpServer {
                     self.pageindex.clone(),
                     self.r2.clone(),
                 )
-                .await?
+                .await
             }
             "ragmcp_update_doc" => {
                 tools::handle_update_doc(
@@ -325,7 +344,7 @@ impl McpServer {
                     self.pageindex.clone(),
                     self.r2.clone(),
                 )
-                .await?
+                .await
             }
             "ragmcp_delete_doc" => {
                 tools::handle_delete_doc(
@@ -335,7 +354,7 @@ impl McpServer {
                     self.chunk_cache.clone(),
                     self.r2.clone(),
                 )
-                .await?
+                .await
             }
             "ragmcp_reindex" => {
                 tools::handle_reindex(
@@ -347,7 +366,7 @@ impl McpServer {
                     self.pageindex.clone(),
                     self.r2.clone(),
                 )
-                .await?
+                .await
             }
             "ragmcp_reason" => {
                 if let Some(pi) = &self.pageindex {
@@ -359,15 +378,18 @@ impl McpServer {
                         &params.arguments,
                         self.chunk_cache.clone(),
                     )
-                    .await?
+                    .await
                 } else {
-                     return Ok(JsonRpcResponse {
+                    // Same sentence the client receives — the terminal must not paraphrase it.
+                    let message = "PageIndex reasoning is not enabled. Launch with --reasoning to use this tool.";
+                    log::error!("{}", message);
+                    return Ok(JsonRpcResponse {
                         jsonrpc: "2.0".to_string(),
                         id: id.clone().into(),
                         payload: JsonRpcResponsePayload::Error {
                             error: JsonRpcError {
                                 code: error_codes::INVALID_PARAMS,
-                                message: "PageIndex reasoning is not enabled. Launch with --reasoning to use this tool.".to_string(),
+                                message: message.to_string(),
                                 data: None,
                             },
                         },
@@ -375,13 +397,15 @@ impl McpServer {
                 }
             }
             _ => {
+                let message = format!("Unknown tool: {}", params.name);
+                log::error!("{}", message);
                 return Ok(JsonRpcResponse {
                     jsonrpc: "2.0".to_string(),
                     id: id.clone().into(),
                     payload: JsonRpcResponsePayload::Error {
                         error: JsonRpcError {
                             code: error_codes::INVALID_PARAMS,
-                            message: format!("Unknown tool: {}", params.name),
+                            message,
                             data: None,
                         },
                     },
@@ -389,14 +413,37 @@ impl McpServer {
             }
         };
 
-        Ok(JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
-            id: id.clone().into(),
-            payload: JsonRpcResponsePayload::Result {
-                result: serde_json::to_value(&result)
-                    .map_err(|e| RagmcpError::Config(format!("JSON serialization error: {}", e)))?,
-            },
-        })
+        match outcome {
+            Ok(result) => {
+                // is_error is a tool failure delivered as a normal JSON-RPC result.
+                // Keep that contract; only the terminal line changes.
+                if result.is_error == Some(true) {
+                    let reason = result
+                        .content
+                        .iter()
+                        .map(|item| item.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    log::error!("tool call {} failed: {}", params.name, reason);
+                } else {
+                    log::info!("tool call {} ok", params.name);
+                }
+
+                Ok(JsonRpcResponse {
+                    jsonrpc: "2.0".to_string(),
+                    id: id.clone().into(),
+                    payload: JsonRpcResponsePayload::Result {
+                        result: serde_json::to_value(&result).map_err(|e| {
+                            RagmcpError::Config(format!("JSON serialization error: {}", e))
+                        })?,
+                    },
+                })
+            }
+            Err(e) => {
+                log::error!("tool call {} failed: {}", params.name, e);
+                Err(e)
+            }
+        }
     }
 
     /// Handle shutdown request
@@ -464,6 +511,23 @@ fn extract_id_from_line(line: &str) -> Option<Value> {
     None
 }
 
+/// Compact JSON of tool arguments for the terminal log.
+///
+/// Callers emit this only through `log`. env_logger writes stderr, which keeps
+/// stdio MCP stdout limited to JSON-RPC. Arguments longer than 2000 characters
+/// are cut so a document body cannot flood the operator terminal. The cut is
+/// on Unicode scalar values so a multibyte character is never split.
+fn format_tool_args(value: &Value) -> String {
+    const MAX_ARG_LOG_CHARS: usize = 2000;
+    let raw = value.to_string();
+    let char_len = raw.chars().count();
+    if char_len <= MAX_ARG_LOG_CHARS {
+        return raw;
+    }
+    let head: String = raw.chars().take(MAX_ARG_LOG_CHARS).collect();
+    format!("{head}... [truncated]")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,5 +559,25 @@ mod tests {
         let request = request.unwrap();
         assert_eq!(request.method, "initialize");
         assert_eq!(request.jsonrpc, "2.0");
+    }
+
+    #[test]
+    fn test_format_tool_args_truncates_over_2000_chars() {
+        let short = serde_json::json!({"limit": 5, "query": "rust"});
+        assert_eq!(format_tool_args(&short), r#"{"limit":5,"query":"rust"}"#);
+        assert!(!format_tool_args(&short).contains("[truncated]"));
+
+        // JSON string quotes add 2 characters, so 1998 b's is exactly 2000.
+        let exact = Value::String("b".repeat(1998));
+        assert_eq!(exact.to_string().chars().count(), 2000);
+        assert_eq!(format_tool_args(&exact), exact.to_string());
+
+        let over = Value::String("c".repeat(1999));
+        let formatted = format_tool_args(&over);
+        let prefix = formatted
+            .strip_suffix("... [truncated]")
+            .expect("over-cap arguments must end with the truncation marker");
+        assert_eq!(prefix.chars().count(), 2000);
+        assert!(over.to_string().starts_with(prefix));
     }
 }
