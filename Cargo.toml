@@ -56,6 +56,10 @@ walkdir = "2.5"
 quick-xml = { version = "0.39", features = ["serialize"] }
 serde_yaml_ng = "0.10"
 pulldown-cmark = "0.13"
+# RFC 4180 CSV (quoted commas/newlines). Why: language tables and logic matrices
+# must keep column names beside cell values; a split on ',' would break quoted fields.
+# Remove: drop this crate, parsers/csv.rs, and "csv" from is_indexable_extension.
+csv = "1.3"
 
 # Caching
 lru = "0.16"

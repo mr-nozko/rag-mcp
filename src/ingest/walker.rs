@@ -20,7 +20,7 @@ pub fn is_indexable_extension(ext: &str) -> bool {
         // Documentation / markup
         "md" | "txt" | "xml" |
         // Data / configuration
-        "yaml" | "yml" | "json" | "toml" |
+        "yaml" | "yml" | "json" | "toml" | "csv" |
         // Source code (optional — useful for code-knowledge RAG)
         "rs" | "py" | "ts" | "js" | "go"
     )
@@ -33,7 +33,7 @@ pub fn is_indexable_extension(ext: &str) -> bool {
 ///
 /// **Supported extensions** (case-insensitive):
 /// - Documents: `.md`, `.txt`, `.xml`
-/// - Data: `.yaml`, `.yml`, `.json`, `.toml`
+/// - Data: `.yaml`, `.yml`, `.json`, `.toml`, `.csv`
 /// - Code (optional — index your source too): `.rs`, `.py`, `.ts`, `.js`, `.go`
 pub fn discover_files(root: &Path) -> Result<Vec<FileMetadata>> {
     let mut files = Vec::new();
@@ -132,6 +132,7 @@ mod tests {
     fn test_is_indexable_extension() {
         assert!(is_indexable_extension("md"));
         assert!(is_indexable_extension("toml"));
+        assert!(is_indexable_extension("csv"));
         assert!(is_indexable_extension("rs"));
         assert!(!is_indexable_extension("png"));
         assert!(!is_indexable_extension(""));
