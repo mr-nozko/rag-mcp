@@ -3,6 +3,7 @@ pub mod yaml;
 pub mod json;
 pub mod markdown;
 pub mod plaintext;
+pub mod csv;
 
 use crate::error::Result;
 
@@ -47,6 +48,7 @@ impl ParserRegistry {
         registry.register(Box::new(yaml::YamlParser));
         registry.register(Box::new(json::JsonParser));
         registry.register(Box::new(markdown::MarkdownParser));
+        registry.register(Box::new(csv::CsvParser));
         // Register last: can_parse is txt-only so it won't shadow structured parsers
         registry.register(Box::new(plaintext::PlainTextParser));
         
@@ -116,6 +118,7 @@ mod tests {
         assert!(registry.find_parser("json").is_some());
         assert!(registry.find_parser("md").is_some());
         assert!(registry.find_parser("txt").is_some());
+        assert!(registry.find_parser("csv").is_some());
         // Toml still has no dedicated parser (walker may discover it; ingest will error)
         assert!(registry.find_parser("toml").is_none());
     }

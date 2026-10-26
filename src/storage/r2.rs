@@ -792,6 +792,7 @@ fn content_type_for_path(key: &str) -> &'static str {
         .as_str()
     {
         "md" | "markdown" | "txt" => "text/plain; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
         "json" => "application/json",
         "yaml" | "yml" => "application/yaml",
         "xml" => "application/xml",
