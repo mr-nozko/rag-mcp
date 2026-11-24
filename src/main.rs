@@ -4,7 +4,9 @@ use ragmcp::db::{Db, migrate};
 use ragmcp::embeddings::OpenAIEmbedder;
 use ragmcp::mcp::{HttpMcpServer, McpServer, ReadyState};
 use ragmcp::pageindex::PageIndexManager;
-use ragmcp::storage::{self, hydrate_docs, pull_missing_to_folder, R2Client};
+use ragmcp::storage::{
+    self, hydrate_docs, pull_missing_to_folder, sync_backup_from_r2, sync_latest_wins, R2Client,
+};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -212,6 +214,10 @@ async fn main() -> Result<()> {
             // Pull missing docs from R2 into local rag_folder (never overwrite)
             run_pull_r2().await?;
         }
+        "sync-r2" => {
+            // Bidirectional latest-wins migrate (default) or R2→local backup overwrite
+            run_sync_r2(&args).await?;
+        }
         "index-pageindex" => {
             // Offline batch indexer for PageIndex ToCs
             run_pageindex_indexer().await?;
@@ -236,6 +242,31 @@ async fn run_pull_r2() -> Result<()> {
     let folder = config.rag_folder().to_path_buf();
     log::info!("pull-r2: destination {}", folder.display());
     pull_missing_to_folder(&client, &folder).await?;
+    Ok(())
+}
+
+/// CLI: `sync-r2` / `sync-r2 --migrate` = latest-wins both ways; `sync-r2 --backup` = R2→local mirror.
+/// Works with credentials even when `storage.backend != "r2"` (same as pull-r2).
+async fn run_sync_r2(args: &[String]) -> Result<()> {
+    print_startup_banner();
+    let backup = args.iter().any(|a| a == "--backup");
+    // `--migrate` is the explicit alias for the default mode (ignored when --backup is set).
+    let mode = if backup { "backup" } else { "migrate" };
+    log::info!("sync-r2 ({}): loading config + R2 credentials", mode);
+    let config = Config::load()?;
+    let client = config.r2_client_from_config()?;
+    let folder = config.rag_folder().to_path_buf();
+    log::info!("sync-r2 ({}): folder {}", mode, folder.display());
+
+    let stats = if backup {
+        sync_backup_from_r2(&client, &folder).await?
+    } else {
+        sync_latest_wins(&client, &folder).await?
+    };
+    println!(
+        "sync-r2 complete: pushed={}, pulled={}, skipped_same={}, failed={}",
+        stats.pushed, stats.pulled, stats.skipped, stats.failed
+    );
     Ok(())
 }
 
