@@ -226,31 +226,73 @@ Point the MCP HTTP URL at `https://YOUR-HOST/mcp` (legacy `/sse` still works).
 |-----------|------------|
 | Server slept (free tier) | Open `/wake` until 200, then use Claude/Cursor |
 | New docs created via MCP on the server | Stored in R2 automatically |
-| Want those new files on your laptop | On the laptop: set R2 env vars + `[storage.r2]` in config (backend need **not** be `r2`), run `ragmcp pull-r2` |
-| New docs only on laptop | Upload/sync them to R2 again (Part A), then restart/wake server so it hydrates |
+| Want those new files on your laptop (safe, no overwrite) | On the laptop: set R2 env vars + `[storage.r2]` in config (backend need **not** be `r2`), run `ragmcp pull-r2` |
+| Want a full local mirror of R2 (overwrite OK) | `ragmcp sync-r2 --backup` (see Part G) |
+| First-time dual laptop + server merge | `ragmcp sync-r2` once (latest-wins), then switch laptop to `backend=r2` (see **Dual-instance migration** below) |
+| New docs only on laptop (before R2 is SoT) | Prefer `ragmcp sync-r2` (pushes newer local files); or re-upload via Part A |
 | Redeploy on Render | Normal — next boot restores from R2 snapshot |
 
 ---
 
-## Part G — Pull new server docs to your laptop
+## Part G — Pull / backup server docs to your laptop
 
 On the machine where your local docs folder lives:
 
 1. Ensure `.env` (or the environment) has `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, plus `R2_BUCKET` and `R2_ENDPOINT` (or real values in `[storage.r2]`).
 2. Ensure config has an `[storage.r2]` section (placeholders OK if env overrides are set). You can keep `backend` unset / not `r2` so normal local serve stays local-only.
-3. From this project directory:
+3. From this project directory, choose one:
+
+**Additive pull (never overwrites existing local files):**
 
 ```bash
 ragmcp pull-r2
 ```
 
-This copies **only files that do not already exist** locally. It never overwrites or deletes. It skips `_ragmcp/`.
+Copies **only files that do not already exist** locally. It never overwrites or deletes. It skips `_ragmcp/`.
+
+**Backup mirror (R2 is source of truth — overwrite allowed):**
+
+```bash
+ragmcp sync-r2 --backup
+```
+
+Pulls every remote doc that is missing or differs locally (size/etag). Does **not** push local-only files. Skips `_ragmcp/`. Use this after migration when R2 is SoT and you want the laptop folder to match the bucket.
+
+---
+
+## Dual-instance migration (laptop + Render, latest-wins)
+
+Use this once when both the laptop docs folder and the R2 bucket already have documents and you need them to converge before treating R2 as the source of truth.
+
+1. Fill `.env` with R2 credentials (`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_BUCKET`, `R2_ENDPOINT` as needed). Do **not** commit `.env`.
+2. Keep `storage.backend` **not** set to `r2` yet (local `rag_folder` stays the working docs path).
+3. From `release/` (or wherever the `ragmcp` binary is):
+
+```bash
+ragmcp sync-r2
+# equivalent:
+ragmcp sync-r2 --migrate
+```
+
+This compares every doc path on R2 and local, keeps **only the latest** by timestamp (local mtime vs R2 `LastModified`), and writes that version onto the other side. Identical content (size + MD5/etag) is skipped. Ties within 1 second prefer **local**. Skips `_ragmcp/`. On success it writes a `.ragmcp-r2-cache` marker into the docs folder.
+
+4. **Manually** switch the laptop config (do not automate this in the CLI):
+
+```toml
+[storage]
+backend = "r2"
+cache_dir = "PATH_TO_YOUR_DOCS_FOLDER"  # same folder that now has .ragmcp-r2-cache
+```
+
+5. Restart the laptop MCP process, then wake Render (`/wake`) so the server hydrates/restores from R2.
+6. Day-to-day: refresh a local backup with `ragmcp sync-r2 --backup` (or use `pull-r2` when you only want missing files).
 
 ---
 
 ## Part H — Checklist
 
 - [ ] Docs uploaded to R2 (no `ragmcp.db` seed)
+- [ ] Dual-instance: ran `ragmcp sync-r2` once, then set laptop `backend=r2` + `cache_dir` manually (marker present)
 - [ ] `config.server.toml.example` keeps placeholders in git (no real bucket/endpoint committed)
 - [ ] Render Web Service (Docker) created
 - [ ] Env vars set on Render including `R2_BUCKET`, `R2_ENDPOINT`, and R2 keys

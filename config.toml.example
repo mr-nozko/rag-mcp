@@ -88,3 +88,17 @@ tree_cache_dir = "./ragmcp_data/pageindex"
 rebuild_on_update = true
 index_on_startup = true
 eligible_extensions = ["md", "pdf", "txt"]
+
+# Optional R2: `ragmcp sync-r2` (latest-wins migrate) / `sync-r2 --backup` / `pull-r2`.
+# After migrate, laptop may set backend = "r2" + cache_dir = docs folder (see DEPLOY_R2.md).
+# Real bucket/endpoint/keys should come from .env (R2_BUCKET, R2_ENDPOINT, R2_*_KEY).
+# [storage]
+# backend = "r2"
+# cache_dir = "D:/path/to/docs"
+#
+# [storage.r2]
+# bucket = "your-bucket-name"
+# endpoint = "https://YOUR_ACCOUNT_ID.r2.cloudflarestorage.com"
+# access_key_env = "R2_ACCESS_KEY_ID"
+# secret_key_env = "R2_SECRET_ACCESS_KEY"
+# snapshot_key = "_ragmcp/ragmcp.db"

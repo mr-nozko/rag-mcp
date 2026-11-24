@@ -1,7 +1,8 @@
 //! Minimal Cloudflare R2 (S3-compatible) client using SigV4 + reqwest.
 //!
 //! Kept dependency-light on purpose: no aws-sdk-s3. Supports list/get/put/delete
-//! plus hydrate, pull-missing, and SQLite snapshot backup upload/download.
+//! plus hydrate, pull-missing, latest-wins sync, backup-pull, and SQLite snapshot
+//! backup upload/download.
 
 use crate::db::Db;
 use crate::error::{RagmcpError, Result};
@@ -18,8 +19,40 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
+
+/// One object from ListObjectsV2 (key/size/etag + optional LastModified).
+#[derive(Debug, Clone)]
+pub struct ListedObject {
+    pub key: String,
+    pub size: u64,
+    pub etag: String,
+    /// Parsed from ListObjectsV2 `<LastModified>` when present (ISO-8601 / RFC3339).
+    pub last_modified: Option<SystemTime>,
+}
+
+/// Counters printed by `sync-r2` (migrate + backup modes).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SyncStats {
+    pub pushed: usize,
+    pub pulled: usize,
+    /// Content identical (size + MD5/etag) — no transfer.
+    pub skipped: usize,
+    pub failed: usize,
+}
+
+/// Decision for one path during latest-wins migration (unit-tested without network).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncAction {
+    Push,
+    Pull,
+    Skip,
+}
+
+/// Equal-time window: treat local/remote mtimes within this delta as a tie.
+/// Migration bias prefers LOCAL on ties (laptop was the active editor).
+const SYNC_TIME_EQUAL_SECS: u64 = 1;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -225,7 +258,18 @@ impl R2Client {
     }
 
     /// List all object keys + sizes + etags (paginated ListObjectsV2).
+    /// Thin wrapper over [`Self::list_objects_detailed`] for hydrate/pull call sites.
     pub async fn list_objects(&self) -> Result<Vec<(String, u64, String)>> {
+        let detailed = self.list_objects_detailed().await?;
+        Ok(detailed
+            .into_iter()
+            .map(|o| (o.key, o.size, o.etag))
+            .collect())
+    }
+
+    /// List all objects with LastModified when the XML includes it (one ListObjectsV2
+    /// sequence for the whole bucket — preferred for sync to avoid per-object HEAD).
+    pub async fn list_objects_detailed(&self) -> Result<Vec<ListedObject>> {
         let mut out = Vec::new();
         let mut token: Option<String> = None;
         loop {
@@ -251,8 +295,34 @@ impl R2Client {
                 _ => break,
             }
         }
-        self.counters.log("list_objects");
+        self.counters.log("list_objects_detailed");
         Ok(out)
+    }
+
+    /// HEAD fallback for Last-Modified when ListObjectsV2 omitted it.
+    /// Counted as a get-class call (API economy). Returns None on 404 / missing header.
+    async fn head_last_modified(&self, key: &str) -> Result<Option<SystemTime>> {
+        self.counters.get.fetch_add(1, Ordering::Relaxed);
+        let resp = self
+            .signed_request_response("HEAD", key, &[], None, b"")
+            .await?;
+        let status = resp.status();
+        if status.as_u16() == 404 {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(RagmcpError::Config(format!(
+                "R2 HeadObject '{}' failed ({})",
+                key,
+                status.as_u16()
+            )));
+        }
+        let mtime = resp
+            .headers()
+            .get("last-modified")
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_http_last_modified);
+        Ok(mtime)
     }
 
     /// Download object bytes into memory (reindex / small objects / lazy fetch).
@@ -1068,7 +1138,7 @@ pub async fn pull_missing_to_folder(client: &R2Client, rag_folder: &Path) -> Res
     Ok(())
 }
 
-fn parse_list_objects_v2(xml: &[u8]) -> Result<(Vec<(String, u64, String)>, Option<String>)> {
+fn parse_list_objects_v2(xml: &[u8]) -> Result<(Vec<ListedObject>, Option<String>)> {
     let text = String::from_utf8_lossy(xml);
     let mut reader = Reader::from_str(&text);
     reader.config_mut().trim_text(true);
@@ -1079,10 +1149,12 @@ fn parse_list_objects_v2(xml: &[u8]) -> Result<(Vec<(String, u64, String)>, Opti
     let mut in_key = false;
     let mut in_size = false;
     let mut in_etag = false;
+    let mut in_last_modified = false;
     let mut in_next = false;
     let mut cur_key = String::new();
     let mut cur_size: u64 = 0;
     let mut cur_etag = String::new();
+    let mut cur_last_modified: Option<SystemTime> = None;
     let mut buf = Vec::new();
 
     loop {
@@ -1097,10 +1169,13 @@ fn parse_list_objects_v2(xml: &[u8]) -> Result<(Vec<(String, u64, String)>, Opti
                         cur_key.clear();
                         cur_size = 0;
                         cur_etag.clear();
+                        cur_last_modified = None;
                     }
                     "Key" if in_contents => in_key = true,
                     "Size" if in_contents => in_size = true,
                     "ETag" if in_contents => in_etag = true,
+                    // ISO-8601 timestamp from ListObjectsV2 — preferred over per-object HEAD.
+                    "LastModified" if in_contents => in_last_modified = true,
                     "NextContinuationToken" => in_next = true,
                     _ => {}
                 }
@@ -1114,6 +1189,8 @@ fn parse_list_objects_v2(xml: &[u8]) -> Result<(Vec<(String, u64, String)>, Opti
                     cur_size = s.parse().unwrap_or(0);
                 } else if in_etag {
                     cur_etag = s;
+                } else if in_last_modified {
+                    cur_last_modified = parse_r2_last_modified(&s);
                 } else if in_next {
                     next_token = Some(s);
                 }
@@ -1124,17 +1201,19 @@ fn parse_list_objects_v2(xml: &[u8]) -> Result<(Vec<(String, u64, String)>, Opti
                 match local {
                     "Contents" => {
                         if !cur_key.is_empty() {
-                            objects.push((
-                                cur_key.clone(),
-                                cur_size,
-                                normalize_etag(&cur_etag),
-                            ));
+                            objects.push(ListedObject {
+                                key: cur_key.clone(),
+                                size: cur_size,
+                                etag: normalize_etag(&cur_etag),
+                                last_modified: cur_last_modified,
+                            });
                         }
                         in_contents = false;
                     }
                     "Key" => in_key = false,
                     "Size" => in_size = false,
                     "ETag" => in_etag = false,
+                    "LastModified" => in_last_modified = false,
                     "NextContinuationToken" => in_next = false,
                     _ => {}
                 }
@@ -1152,6 +1231,342 @@ fn parse_list_objects_v2(xml: &[u8]) -> Result<(Vec<(String, u64, String)>, Opti
     }
 
     Ok((objects, next_token))
+}
+
+/// Parse ListObjectsV2 `<LastModified>` (RFC3339 / ISO-8601, e.g. `2024-01-15T12:34:56.000Z`).
+fn parse_r2_last_modified(s: &str) -> Option<SystemTime> {
+    let dt = chrono::DateTime::parse_from_rfc3339(s.trim()).ok()?;
+    system_time_from_chrono(dt.timestamp(), dt.timestamp_subsec_nanos())
+}
+
+/// Parse HTTP `Last-Modified` (RFC 2822) from a HEAD response.
+fn parse_http_last_modified(s: &str) -> Option<SystemTime> {
+    let dt = chrono::DateTime::parse_from_rfc2822(s.trim()).ok()?;
+    system_time_from_chrono(dt.timestamp(), dt.timestamp_subsec_nanos())
+}
+
+fn system_time_from_chrono(secs: i64, nanos: u32) -> Option<SystemTime> {
+    if secs < 0 {
+        return None;
+    }
+    Some(UNIX_EPOCH + Duration::new(secs as u64, nanos))
+}
+
+/// Latest-wins conflict policy (pure; no I/O).
+///
+/// - `content_same` → Skip
+/// - local-only (`remote_mtime` None) → Push
+/// - R2-only (`local_mtime` None) → Pull
+/// - local newer → Push; R2 newer → Pull
+/// - equal within [`SYNC_TIME_EQUAL_SECS`] (or exact equal) but content differs → Push (local bias)
+pub fn decide_sync_action(
+    local_mtime: Option<SystemTime>,
+    remote_mtime: Option<SystemTime>,
+    content_same: bool,
+) -> SyncAction {
+    // Identical payload — no transfer either direction.
+    if content_same {
+        return SyncAction::Skip;
+    }
+    match (local_mtime, remote_mtime) {
+        // Local-only document → push so R2 gains it (never delete the other side).
+        (Some(_), None) => SyncAction::Push,
+        // R2-only document → pull so local mirrors it.
+        (None, Some(_)) => SyncAction::Pull,
+        (None, None) => {
+            // Both missing timestamps but content differs: migration bias prefers laptop.
+            SyncAction::Push
+        }
+        (Some(local), Some(remote)) => {
+            // Within 1s → treat as tie → prefer LOCAL (active laptop editor).
+            let equal = match local.duration_since(remote) {
+                Ok(d) => d.as_secs() <= SYNC_TIME_EQUAL_SECS,
+                Err(e) => e.duration().as_secs() <= SYNC_TIME_EQUAL_SECS,
+            };
+            if equal {
+                return SyncAction::Push;
+            }
+            if local > remote {
+                SyncAction::Push
+            } else {
+                SyncAction::Pull
+            }
+        }
+    }
+}
+
+/// Bidirectional latest-wins sync: for every doc path keep the newest side, write it
+/// onto the other so both match. Skips `_ragmcp/`. After success writes cache marker.
+pub async fn sync_latest_wins(client: &R2Client, rag_folder: &Path) -> Result<SyncStats> {
+    let rag_folder = prepare_sync_folder(rag_folder)?;
+    let remote = load_remote_docs_map(client).await?;
+    let local_files = crate::ingest::discover_files(&rag_folder)?;
+
+    // Union of local relative paths + remote keys (docs only).
+    let mut all_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut local_by_key: HashMap<String, crate::ingest::FileMetadata> = HashMap::new();
+    for f in local_files {
+        // Never treat internal snapshot paths as user docs.
+        if is_internal_r2_key(&f.relative_path) {
+            continue;
+        }
+        all_keys.insert(f.relative_path.clone());
+        local_by_key.insert(f.relative_path.clone(), f);
+    }
+    for key in remote.keys() {
+        all_keys.insert(key.clone());
+    }
+
+    let mut stats = SyncStats::default();
+    for key in all_keys {
+        match sync_one_latest_wins(client, &rag_folder, &key, local_by_key.get(&key), remote.get(&key))
+            .await
+        {
+            Ok(SyncAction::Push) => stats.pushed += 1,
+            Ok(SyncAction::Pull) => stats.pulled += 1,
+            Ok(SyncAction::Skip) => stats.skipped += 1,
+            Err(e) => {
+                eprintln!("FAIL  {} ({})", key, e);
+                stats.failed += 1;
+            }
+        }
+    }
+
+    // Mark docs folder so laptop can later set backend=r2 + cache_dir = this folder.
+    write_cache_marker(&rag_folder)?;
+    client.counters().log("sync_latest_wins");
+    if stats.failed > 0 {
+        return Err(RagmcpError::Config(format!(
+            "sync-r2 migrate finished with {} failure(s)",
+            stats.failed
+        )));
+    }
+    Ok(stats)
+}
+
+/// After R2 is SoT: mirror R2 → local (overwrite allowed). Does not push local-only files.
+pub async fn sync_backup_from_r2(client: &R2Client, rag_folder: &Path) -> Result<SyncStats> {
+    let rag_folder = prepare_sync_folder(rag_folder)?;
+    let remote = load_remote_docs_map(client).await?;
+    let mut stats = SyncStats::default();
+
+    for (key, obj) in &remote {
+        let local = match resolve_pull_path(&rag_folder, key) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                stats.skipped += 1;
+                continue;
+            }
+            Err(e) => {
+                eprintln!("FAIL  {} ({})", key, e);
+                stats.failed += 1;
+                continue;
+            }
+        };
+        if should_skip_hydrate_path(&local) {
+            println!("SKIP  {} (is directory)", key);
+            stats.skipped += 1;
+            continue;
+        }
+
+        // Same content check as migrate: size + MD5 vs listed etag → skip transfer.
+        let content_same = local_matches_listed(&local, obj.size, &obj.etag);
+        if content_same {
+            println!("SKIP  {} (same)", key);
+            stats.skipped += 1;
+            continue;
+        }
+
+        // Pull (overwrite) whenever remote differs or local is missing.
+        match pull_object_to_path(client, key, &local).await {
+            Ok(()) => {
+                println!("PULL  {} → {}", key, local.display());
+                stats.pulled += 1;
+            }
+            Err(e) => {
+                eprintln!("FAIL  {} ({})", key, e);
+                stats.failed += 1;
+            }
+        }
+    }
+
+    // Refresh marker so cache_dir ownership stays valid for a later backend=r2 switch.
+    write_cache_marker(&rag_folder)?;
+    client.counters().log("sync_backup_from_r2");
+    if stats.failed > 0 {
+        return Err(RagmcpError::Config(format!(
+            "sync-r2 --backup finished with {} failure(s)",
+            stats.failed
+        )));
+    }
+    Ok(stats)
+}
+
+/// Ensure rag_folder exists and is canonical (PathValidator requires a real root).
+fn prepare_sync_folder(rag_folder: &Path) -> Result<PathBuf> {
+    if !rag_folder.exists() {
+        fs::create_dir_all(rag_folder).map_err(RagmcpError::Io)?;
+    }
+    rag_folder
+        .canonicalize()
+        .map_err(|e| RagmcpError::Config(format!("Cannot canonicalize rag_folder: {}", e)))
+}
+
+/// One ListObjectsV2 → map of doc key → ListedObject (skips `_ragmcp/`).
+async fn load_remote_docs_map(client: &R2Client) -> Result<HashMap<String, ListedObject>> {
+    let objects = client.list_objects_detailed().await?;
+    let mut map = HashMap::new();
+    for obj in objects {
+        if is_internal_r2_key(&obj.key) {
+            continue;
+        }
+        // Folder markers are not documents.
+        if obj.key.ends_with('/') {
+            continue;
+        }
+        map.insert(obj.key.clone(), obj);
+    }
+    Ok(map)
+}
+
+/// Apply latest-wins for a single key; returns the action taken (or Skip).
+async fn sync_one_latest_wins(
+    client: &R2Client,
+    rag_folder: &Path,
+    key: &str,
+    local: Option<&crate::ingest::FileMetadata>,
+    remote: Option<&ListedObject>,
+) -> Result<SyncAction> {
+    let local_path = match resolve_pull_path(rag_folder, key)? {
+        Some(p) => p,
+        None => return Ok(SyncAction::Skip),
+    };
+    if should_skip_hydrate_path(&local_path) {
+        println!("SKIP  {} (is directory)", key);
+        return Ok(SyncAction::Skip);
+    }
+
+    let local_exists = local.is_some() || local_path.is_file();
+    let (local_mtime, local_size) = if let Some(meta) = local {
+        (Some(meta.modified), meta.file_size)
+    } else if local_path.is_file() {
+        let m = fs::metadata(&local_path).map_err(RagmcpError::Io)?;
+        (
+            Some(m.modified().map_err(RagmcpError::Io)?),
+            m.len(),
+        )
+    } else {
+        (None, 0)
+    };
+
+    let mut remote_mtime = remote.and_then(|o| o.last_modified);
+    let remote_size = remote.map(|o| o.size).unwrap_or(0);
+    let remote_etag = remote.map(|o| o.etag.as_str()).unwrap_or("");
+
+    // Content-identical when local size matches listed size AND local MD5 == etag.
+    let content_same = if local_exists && remote.is_some() {
+        local_size == remote_size
+            && file_md5_hex(&local_path).map(|h| h == remote_etag).unwrap_or(false)
+    } else {
+        false
+    };
+
+    // HEAD only when both sides exist, content differs, and list omitted LastModified.
+    if !content_same && local_mtime.is_some() && remote.is_some() && remote_mtime.is_none() {
+        match client.head_last_modified(key).await {
+            Ok(Some(t)) => remote_mtime = Some(t),
+            Ok(None) => {}
+            Err(e) => {
+                log::warn!(
+                    "sync-r2: HEAD Last-Modified failed for '{}': {} — continuing with list data",
+                    key,
+                    e
+                );
+            }
+        }
+    }
+
+    // R2-only: decide with local_mtime=None even if path somehow exists empty — use flags.
+    let action = decide_sync_action(
+        if local_exists { local_mtime } else { None },
+        if remote.is_some() {
+            // If still no mtime, pass a sentinel so decide sees "remote exists".
+            // Prefer UNIX_EPOCH so a real local mtime wins; equal-time bias still pushes local
+            // when both are missing meaningful stamps (both map to epoch only if HEAD failed
+            // and local also lacked mtime — rare).
+            Some(remote_mtime.unwrap_or(UNIX_EPOCH))
+        } else {
+            None
+        },
+        content_same,
+    );
+
+    match action {
+        SyncAction::Skip => {
+            println!("SKIP  {} (same)", key);
+            Ok(SyncAction::Skip)
+        }
+        SyncAction::Push => {
+            if !local_exists {
+                // Should not happen for Push with local-only/tie rules — treat as skip.
+                return Ok(SyncAction::Skip);
+            }
+            let bytes = fs::read(&local_path).map_err(RagmcpError::Io)?;
+            client.put_document(key, &bytes).await?;
+            println!("PUSH  {} → R2 ({} bytes)", key, bytes.len());
+            Ok(SyncAction::Push)
+        }
+        SyncAction::Pull => {
+            pull_object_to_path(client, key, &local_path).await?;
+            println!("PULL  {} → {}", key, local_path.display());
+            Ok(SyncAction::Pull)
+        }
+    }
+}
+
+/// True when local file size matches listed size and MD5 hex equals listed etag.
+fn local_matches_listed(local: &Path, listed_size: u64, listed_etag: &str) -> bool {
+    if !local.is_file() {
+        return false;
+    }
+    let Ok(meta) = fs::metadata(local) else {
+        return false;
+    };
+    if meta.len() != listed_size {
+        return false;
+    }
+    match file_md5_hex(local) {
+        Ok(hex) => hex == listed_etag,
+        Err(_) => false,
+    }
+}
+
+/// Download one object and overwrite `dest` (creates parents). Skips EISDIR quietly as error.
+async fn pull_object_to_path(client: &R2Client, key: &str, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(RagmcpError::Io)?;
+    }
+    if should_skip_hydrate_path(dest) {
+        return Err(RagmcpError::Config(format!(
+            "cannot pull '{}' — destination is a directory",
+            key
+        )));
+    }
+    let bytes = client.get_object(key).await?;
+    if should_skip_hydrate_path(dest) {
+        return Err(RagmcpError::Config(format!(
+            "cannot pull '{}' — destination became a directory",
+            key
+        )));
+    }
+    fs::write(dest, &bytes).map_err(|e| {
+        if is_eisdir_io_error(&e) {
+            RagmcpError::Config(format!("write EISDIR for '{}': {}", key, e))
+        } else {
+            RagmcpError::Io(e)
+        }
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1283,11 +1698,85 @@ mod tests {
         </ListBucketResult>"#;
         let (objs, next) = parse_list_objects_v2(xml).unwrap();
         assert_eq!(objs.len(), 2);
-        assert_eq!(objs[0].0, "a.md");
-        assert_eq!(objs[0].1, 12);
-        assert_eq!(objs[0].2, "abc123");
-        assert_eq!(objs[1].2, "def456");
+        assert_eq!(objs[0].key, "a.md");
+        assert_eq!(objs[0].size, 12);
+        assert_eq!(objs[0].etag, "abc123");
+        assert!(objs[0].last_modified.is_none());
+        assert_eq!(objs[1].etag, "def456");
         assert_eq!(next.as_deref(), Some("tok123"));
+    }
+
+    #[test]
+    fn test_parse_list_objects_v2_last_modified() {
+        // ListObjectsV2 emits RFC3339 LastModified — sync uses this to avoid HEAD.
+        let xml = br#"<?xml version="1.0"?>
+        <ListBucketResult>
+          <Contents>
+            <Key>doc.md</Key>
+            <LastModified>2024-06-15T12:34:56.000Z</LastModified>
+            <Size>4</Size>
+            <ETag>"abcd"</ETag>
+          </Contents>
+        </ListBucketResult>"#;
+        let (objs, _) = parse_list_objects_v2(xml).unwrap();
+        assert_eq!(objs.len(), 1);
+        let lm = objs[0].last_modified.expect("LastModified parsed");
+        let expected = parse_r2_last_modified("2024-06-15T12:34:56.000Z").unwrap();
+        assert_eq!(lm, expected);
+    }
+
+    #[test]
+    fn test_decide_sync_action_content_same_skips() {
+        let t = UNIX_EPOCH + Duration::from_secs(100);
+        assert_eq!(
+            decide_sync_action(Some(t), Some(t + Duration::from_secs(50)), true),
+            SyncAction::Skip
+        );
+    }
+
+    #[test]
+    fn test_decide_sync_action_local_newer_pushes() {
+        let local = UNIX_EPOCH + Duration::from_secs(200);
+        let remote = UNIX_EPOCH + Duration::from_secs(100);
+        assert_eq!(
+            decide_sync_action(Some(local), Some(remote), false),
+            SyncAction::Push
+        );
+    }
+
+    #[test]
+    fn test_decide_sync_action_remote_newer_pulls() {
+        let local = UNIX_EPOCH + Duration::from_secs(100);
+        let remote = UNIX_EPOCH + Duration::from_secs(200);
+        assert_eq!(
+            decide_sync_action(Some(local), Some(remote), false),
+            SyncAction::Pull
+        );
+    }
+
+    #[test]
+    fn test_decide_sync_action_equal_time_prefers_local() {
+        // Exact equal + within 1s window → Push (migration bias: laptop was active).
+        let t = UNIX_EPOCH + Duration::from_secs(500);
+        assert_eq!(
+            decide_sync_action(Some(t), Some(t), false),
+            SyncAction::Push
+        );
+        assert_eq!(
+            decide_sync_action(Some(t), Some(t + Duration::from_millis(500)), false),
+            SyncAction::Push
+        );
+        assert_eq!(
+            decide_sync_action(Some(t + Duration::from_millis(800)), Some(t), false),
+            SyncAction::Push
+        );
+    }
+
+    #[test]
+    fn test_decide_sync_action_one_sided() {
+        let t = UNIX_EPOCH + Duration::from_secs(1);
+        assert_eq!(decide_sync_action(Some(t), None, false), SyncAction::Push);
+        assert_eq!(decide_sync_action(None, Some(t), false), SyncAction::Pull);
     }
 
     #[test]
